@@ -179,39 +179,41 @@ impl TouchOverviewGrab {
         let layout = &mut state.niri.layout;
         match self.gesture {
             GestureState::Recognizing => {
-                // Tap to activate.
-                layout.focus_output(&self.output);
+                if state.niri.touchscreen_touches.len() <= 1 {
+                    // Tap to activate.
+                    layout.focus_output(&self.output);
 
-                // Activate the workspace if necessary.
-                if self.window.is_some() || self.workspace_matched_narrow {
-                    // When activating a window, we want to activate the window's current
-                    // workspace. Otherwise, find the workspace that we tapped on.
-                    let ws_matches = |ws: &Workspace<Mapped>| {
-                        if let Some(window) = &self.window {
-                            ws.has_window(window)
-                        } else if let Some(ws_id) = self.workspace_id {
-                            ws.id() == ws_id
+                    // Activate the workspace if necessary.
+                    if self.window.is_some() || self.workspace_matched_narrow {
+                        // When activating a window, we want to activate the window's current
+                        // workspace. Otherwise, find the workspace that we tapped on.
+                        let ws_matches = |ws: &Workspace<Mapped>| {
+                            if let Some(window) = &self.window {
+                                ws.has_window(window)
+                            } else if let Some(ws_id) = self.workspace_id {
+                                ws.id() == ws_id
+                            } else {
+                                false
+                            }
+                        };
+
+                        let ws_idx = if let Some((Some(mon), ws_idx, _)) =
+                            layout.workspaces().find(|(_, _, ws)| ws_matches(ws))
+                        {
+                            // The workspace could've moved to a different output in the meantime.
+                            (*mon.output() == self.output).then_some(ws_idx)
                         } else {
-                            false
+                            None
+                        };
+
+                        if let Some(ws_idx) = ws_idx {
+                            layout.toggle_overview_to_workspace(ws_idx);
                         }
-                    };
-
-                    let ws_idx = if let Some((Some(mon), ws_idx, _)) =
-                        layout.workspaces().find(|(_, _, ws)| ws_matches(ws))
-                    {
-                        // The workspace could've moved to a different output in the meantime.
-                        (*mon.output() == self.output).then_some(ws_idx)
-                    } else {
-                        None
-                    };
-
-                    if let Some(ws_idx) = ws_idx {
-                        layout.toggle_overview_to_workspace(ws_idx);
                     }
-                }
 
-                if let Some(window) = self.window.as_ref() {
-                    layout.activate_window(window);
+                    if let Some(window) = self.window.as_ref() {
+                        layout.activate_window(window);
+                    }
                 }
             }
             GestureState::ViewOffset => {

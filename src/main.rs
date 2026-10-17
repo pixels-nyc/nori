@@ -183,12 +183,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Increase the buffer size so that it's harder to crash a frozen client with a 1000 Hz mouse.
     set_default_max_buffer_size(&display, 1024 * 1024);
 
+    let is_headless = cli.headless
+        || env::var_os("NORI_HEADLESS").is_some()
+        || env::var_os("NORI_HEADLESS_SLOT").is_some();
+
     let mut state = State::new(
         config,
         event_loop.handle(),
         event_loop.get_signal(),
         display,
-        false,
+        is_headless,
         true,
         cli.session,
     )

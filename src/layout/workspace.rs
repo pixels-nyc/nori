@@ -472,6 +472,10 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating.has_window(id)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.scrolling.is_empty() && self.floating.is_empty()
+    }
+
     pub fn current_output(&self) -> Option<&Output> {
         self.output.as_ref()
     }

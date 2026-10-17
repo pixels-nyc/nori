@@ -78,6 +78,10 @@ use crate::protocols::gamma_control::{GammaControlHandler, GammaControlManagerSt
 use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
 use crate::protocols::output_management::{OutputManagementHandler, OutputManagementManagerState};
 use crate::protocols::screencopy::{Screencopy, ScreencopyHandler, ScreencopyManagerState};
+use crate::protocols::virtual_keyboard::{
+    VirtualKeyboardHandler, VirtualKeyboardInputBackend, VirtualKeyboardKeyEvent,
+    VirtualKeyboardManagerState,
+};
 use crate::protocols::virtual_pointer::{
     VirtualPointerAxisEvent, VirtualPointerButtonEvent, VirtualPointerHandler,
     VirtualPointerInputBackend, VirtualPointerManagerState, VirtualPointerMotionAbsoluteEvent,
@@ -677,6 +681,16 @@ impl VirtualPointerHandler for State {
 
     fn on_virtual_pointer_axis(&mut self, event: VirtualPointerAxisEvent) {
         self.process_input_event(InputEvent::<VirtualPointerInputBackend>::PointerAxis { event });
+    }
+}
+
+impl VirtualKeyboardHandler for State {
+    fn virtual_keyboard_manager_state(&mut self) -> &mut VirtualKeyboardManagerState {
+        &mut self.niri.virtual_keyboard_state
+    }
+
+    fn on_virtual_keyboard_key(&mut self, event: VirtualKeyboardKeyEvent) {
+        self.process_input_event(InputEvent::<VirtualKeyboardInputBackend>::Keyboard { event });
     }
 }
 

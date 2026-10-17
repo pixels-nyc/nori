@@ -2595,18 +2595,57 @@ impl Niri {
             .unwrap();
 
         let socket_name = create_wayland_socket.then(|| {
-            let socket_source = ListeningSocketSource::new_auto().unwrap();
-            let socket_name = socket_source.socket_name().to_os_string();
-            event_loop
-                .insert_source(socket_source, move |client, _, state| {
-                    state.niri.insert_client(NewClient {
-                        client,
-                        restricted: false,
-                        credentials_unknown: false,
-                    });
-                })
-                .unwrap();
-            socket_name
+            #[cfg(feature = "systemd")]
+            let activated_fd = sd_notify::listen_fds().ok().and_then(|mut fds| fds.next());
+            #[cfg(not(feature = "systemd"))]
+            let activated_fd: Option<std::os::unix::io::RawFd> = None;
+
+            if let Some(fd) = activated_fd {
+                use std::os::unix::io::FromRawFd;
+                let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+                let _ = listener.set_nonblocking(true);
+                let socket_source = Generic::new(listener, Interest::READ, Mode::Level);
+                event_loop
+                    .insert_source(socket_source, |_, listener, state| {
+                        while let Ok((client, _)) = listener.accept() {
+                            state.niri.insert_client(NewClient {
+                                client,
+                                restricted: false,
+                                credentials_unknown: false,
+                            });
+                        }
+                        Ok(PostAction::Continue)
+                    })
+                    .unwrap();
+                let name = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-nori".to_string());
+                OsString::from(name)
+            } else {
+                let socket_source = if let Ok(slot) = env::var("NORI_HEADLESS_SLOT") {
+                    let name = format!("wayland-nori-{slot}");
+                    ListeningSocketSource::with_name(&name).unwrap_or_else(|e| {
+                        warn!("failed to bind {name}: {e:?}, falling back to auto");
+                        ListeningSocketSource::new_auto().unwrap()
+                    })
+                } else if let Ok(custom_name) = env::var("WAYLAND_DISPLAY") {
+                    ListeningSocketSource::with_name(&custom_name).unwrap_or_else(|e| {
+                        warn!("failed to bind {custom_name}: {e:?}, falling back to auto");
+                        ListeningSocketSource::new_auto().unwrap()
+                    })
+                } else {
+                    ListeningSocketSource::new_auto().unwrap()
+                };
+                let socket_name = socket_source.socket_name().to_os_string();
+                event_loop
+                    .insert_source(socket_source, move |client, _, state| {
+                        state.niri.insert_client(NewClient {
+                            client,
+                            restricted: false,
+                            credentials_unknown: false,
+                        });
+                    })
+                    .unwrap();
+                socket_name
+            }
         });
 
         let ipc_server = match IpcServer::start(&event_loop, socket_name.as_deref()) {

@@ -201,6 +201,10 @@ impl ScreencopyQueue {
             }
         }
     }
+
+    pub fn is_casting(&self) -> bool {
+        self.cast.is_some() || !self.screencopies.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -278,6 +282,10 @@ impl ScreencopyManagerState {
         for queue in self.queues.values_mut() {
             queue.clear_expired_cast();
         }
+    }
+
+    pub fn has_active_cast(&self) -> bool {
+        self.queues.values().any(|queue| queue.is_casting())
     }
 }
 
