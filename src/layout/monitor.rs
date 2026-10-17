@@ -1893,6 +1893,17 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
     }
 
+    pub fn max_gesture_workspace_count(&self) -> usize {
+        if self.workspaces.len() > 1 {
+            if let Some(last_ws) = self.workspaces.last() {
+                if last_ws.name().is_none() && last_ws.is_empty() {
+                    return self.workspaces.len() - 1;
+                }
+            }
+        }
+        self.workspaces.len()
+    }
+
     pub fn workspace_switch_gesture_update(
         &mut self,
         delta_y: f64,
@@ -1907,6 +1918,7 @@ impl<W: LayoutElement> Monitor<W> {
             return None;
         }
 
+        let max_count = self.max_gesture_workspace_count();
         let zoom = self.overview_zoom();
         let total_height = if gesture.is_touchpad {
             WORKSPACE_GESTURE_MOVEMENT
@@ -1933,7 +1945,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         let pos = gesture.tracker.pos() / total_height;
 
-        let (min, max) = gesture.min_max(self.workspaces.len());
+        let (min, max) = gesture.min_max(max_count);
         let new_idx = gesture.start_idx + pos;
         let new_idx = rubber_band.clamp(min, max, new_idx);
 
@@ -2039,6 +2051,7 @@ impl<W: LayoutElement> Monitor<W> {
             return false;
         }
 
+        let max_count = self.max_gesture_workspace_count();
         let zoom = self.overview_zoom();
         let total_height = if gesture.dnd_last_event_time.is_some() {
             WORKSPACE_DND_EDGE_SCROLL_MOVEMENT
@@ -2063,11 +2076,20 @@ impl<W: LayoutElement> Monitor<W> {
         let current_pos = gesture.tracker.pos() / total_height;
         let pos = gesture.tracker.projected_end_pos() / total_height;
 
-        let (min, max) = gesture.min_max(self.workspaces.len());
-        let new_idx = gesture.start_idx + pos;
+        let (min, max) = gesture.min_max(max_count);
+        let unclamped_idx = gesture.start_idx + pos;
 
-        let new_idx = new_idx.clamp(min, max);
-        let new_idx = new_idx.round() as usize;
+        let max_idx = max.round() as usize;
+        let min_idx = min.round() as usize;
+
+        let new_idx = if gesture.start_idx >= max - 0.1 && unclamped_idx > max + 0.15 {
+            min_idx
+        } else if gesture.start_idx <= min + 0.1 && unclamped_idx < min - 0.15 {
+            max_idx
+        } else {
+            let clamped = unclamped_idx.clamp(min, max);
+            clamped.round() as usize
+        };
 
         velocity *= rubber_band.clamp_derivative(min, max, gesture.start_idx + current_pos);
 

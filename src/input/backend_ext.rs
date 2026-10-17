@@ -4,6 +4,7 @@ use smithay::backend::winit::WinitVirtualDevice;
 use smithay::output::Output;
 
 use crate::niri::State;
+use crate::protocols::virtual_keyboard::VirtualKeyboard;
 use crate::protocols::virtual_pointer::VirtualPointer;
 
 pub trait NiriInputBackend: input::InputBackend<Device = Self::NiriDevice> {
@@ -47,5 +48,12 @@ impl NiriInputDevice for WinitVirtualDevice {
 impl NiriInputDevice for VirtualPointer {
     fn output(&self, _: &State) -> Option<Output> {
         self.output().cloned()
+    }
+}
+
+impl NiriInputDevice for VirtualKeyboard {
+    fn output(&self, _: &State) -> Option<Output> {
+        // Keyboards are not mapped to an output.
+        None
     }
 }
