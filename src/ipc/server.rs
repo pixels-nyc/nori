@@ -807,6 +807,24 @@ impl State {
         server.send_event(event);
     }
 
+    pub fn ipc_refresh_tablet_mode(&mut self) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        let mut state = server.event_stream_state.borrow_mut();
+        let state = &mut state.tablet_mode;
+        let is_tablet_mode = self.niri.is_tablet_mode;
+
+        if state.is_tablet_mode == is_tablet_mode {
+            return;
+        }
+
+        let event = Event::TabletModeChanged { is_tablet_mode };
+        state.apply(event.clone());
+        server.send_event(event);
+    }
+
     pub fn ipc_refresh_casts(&mut self) {
         let Some(server) = &self.niri.ipc_server else {
             return;

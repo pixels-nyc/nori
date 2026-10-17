@@ -1710,6 +1710,11 @@ pub enum Event {
         /// The new state of the overview.
         is_open: bool,
     },
+    /// Tablet mode state changed.
+    TabletModeChanged {
+        /// Whether the device is currently in tablet mode.
+        is_tablet_mode: bool,
+    },
     /// The configuration was reloaded.
     ///
     /// You will always receive this event when connecting to the event stream, indicating the last

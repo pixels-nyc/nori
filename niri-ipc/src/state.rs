@@ -44,6 +44,9 @@ pub struct EventStreamState {
     /// State of the overview.
     pub overview: OverviewState,
 
+    /// State of the tablet mode.
+    pub tablet_mode: TabletModeState,
+
     /// State of the config.
     pub config: ConfigState,
 
@@ -79,6 +82,13 @@ pub struct OverviewState {
     pub is_open: bool,
 }
 
+/// The tablet mode state communicated over the event stream.
+#[derive(Debug, Default)]
+pub struct TabletModeState {
+    /// Whether tablet mode is currently active.
+    pub is_tablet_mode: bool,
+}
+
 /// The config state communicated over the event stream.
 #[derive(Debug, Default)]
 pub struct ConfigState {
@@ -100,6 +110,7 @@ impl EventStreamStatePart for EventStreamState {
         events.extend(self.windows.replicate());
         events.extend(self.keyboard_layouts.replicate());
         events.extend(self.overview.replicate());
+        events.extend(self.tablet_mode.replicate());
         events.extend(self.config.replicate());
         events.extend(self.casts.replicate());
         events
@@ -110,6 +121,7 @@ impl EventStreamStatePart for EventStreamState {
         let event = self.windows.apply(event)?;
         let event = self.keyboard_layouts.apply(event)?;
         let event = self.overview.apply(event)?;
+        let event = self.tablet_mode.apply(event)?;
         let event = self.config.apply(event)?;
         let event = self.casts.apply(event)?;
         Some(event)
@@ -273,6 +285,24 @@ impl EventStreamStatePart for OverviewState {
         match event {
             Event::OverviewOpenedOrClosed { is_open } => {
                 self.is_open = is_open;
+            }
+            event => return Some(event),
+        }
+        None
+    }
+}
+
+impl EventStreamStatePart for TabletModeState {
+    fn replicate(&self) -> Vec<Event> {
+        vec![Event::TabletModeChanged {
+            is_tablet_mode: self.is_tablet_mode,
+        }]
+    }
+
+    fn apply(&mut self, event: Event) -> Option<Event> {
+        match event {
+            Event::TabletModeChanged { is_tablet_mode } => {
+                self.is_tablet_mode = is_tablet_mode;
             }
             event => return Some(event),
         }
