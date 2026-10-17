@@ -1,0 +1,19 @@
+{
+  "name": "nori",
+  "source_type": "fork",
+  "fork_version": "26.04-pixos",
+  "upstream": "https://github.com/YaLTeR/niri",
+  "upstream_branch": "main",
+  "build_type": "cargo",
+  "build_cmd": "cargo build --release",
+  "test_cmd": "cargo test -p niri-ipc",
+  "smoke_test_cmd": "target/release/niri --version",
+  "targets": [
+    {
+      "source": "target/release/niri",
+      "dest": "/home/super/.local/bin/niri.real"
+    }
+  ],
+  "restart_hook": "notify-send '󰌢 nori Compositor' 'Activated in ~/.local/bin/niri.real (takes effect on restart)'",
+  "rollback_hook": "notify-send '󰌢 nori Compositor' 'Rolled back to previous production binary'"
+}
