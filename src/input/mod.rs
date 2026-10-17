@@ -4364,6 +4364,7 @@ impl State {
                         start_locations: initial_touches.clone(),
                         last_locations: initial_touches,
                         gesture_type,
+                        pinch_data: None,
                     });
 
                     if handle.is_grabbed() {
@@ -4527,44 +4528,124 @@ impl State {
             let old_location = gesture.last_locations.insert(slot, pos);
 
             if gesture.gesture_type.is_none() {
-                let mut sum_dx = 0.0;
-                let mut sum_dy = 0.0;
-                let mut count = 0;
-                for (s, start_loc) in &gesture.start_locations {
-                    if let Some(last_loc) = gesture.last_locations.get(s) {
-                        let diff = *last_loc - *start_loc;
-                        sum_dx += diff.x;
-                        sum_dy += diff.y;
-                        count += 1;
+                // Check for 3-finger pinch (2 stagnant anchor fingers, 1 moving finger)
+                if gesture.fingers == 3
+                    && gesture.start_locations.len() == 3
+                    && gesture.last_locations.len() == 3
+                {
+                    let mut displacements: Vec<(
+                        smithay::backend::input::TouchSlot,
+                        f64,
+                        Point<f64, Logical>,
+                        Point<f64, Logical>,
+                    )> = gesture
+                        .start_locations
+                        .iter()
+                        .filter_map(|(&s, &start)| {
+                            let curr = gesture.last_locations.get(&s)?;
+                            let diff = *curr - start;
+                            let dist = (diff.x * diff.x + diff.y * diff.y).sqrt();
+                            Some((s, dist, start, *curr))
+                        })
+                        .collect();
+
+                    if displacements.len() == 3 {
+                        displacements.sort_by(|a, b| {
+                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+
+                        let (slot_a, dist_a, start_a, curr_a) = displacements[0];
+                        let (slot_b, dist_b, start_b, curr_b) = displacements[1];
+                        let (slot_c, dist_c, start_c, curr_c) = displacements[2];
+
+                        let stagnant = dist_a <= 35.0 && dist_b <= 35.0;
+                        let moving = dist_c >= 25.0 && dist_c >= dist_b * 1.5 + 8.0;
+
+                        if stagnant && moving {
+                            let anchor_mid_start = Point::from((
+                                (start_a.x + start_b.x) / 2.0,
+                                (start_a.y + start_b.y) / 2.0,
+                            ));
+                            let anchor_mid_curr = Point::from((
+                                (curr_a.x + curr_b.x) / 2.0,
+                                (curr_a.y + curr_b.y) / 2.0,
+                            ));
+
+                            let r_start = {
+                                let diff = start_c - anchor_mid_start;
+                                (diff.x * diff.x + diff.y * diff.y).sqrt()
+                            };
+                            let r_curr = {
+                                let diff = curr_c - anchor_mid_curr;
+                                (diff.x * diff.x + diff.y * diff.y).sqrt()
+                            };
+
+                            let delta_r = r_start - r_curr;
+                            let abs_delta_r = delta_r.abs();
+                            let is_overview_open = self.niri.layout.is_overview_open();
+
+                            let is_pinch_direction = if is_overview_open {
+                                abs_delta_r >= 16.0
+                            } else {
+                                delta_r >= 16.0
+                            };
+
+                            if is_pinch_direction && abs_delta_r >= 0.5 * dist_c {
+                                let layout = &mut self.niri.layout;
+                                layout.overview_gesture_begin();
+                                gesture.gesture_type = Some(TouchscreenGestureType::Overview);
+                                gesture.pinch_data = Some(crate::niri::TouchscreenPinchData {
+                                    moving_slot: slot_c,
+                                    anchor_slots: [slot_a, slot_b],
+                                    last_dist: r_curr,
+                                    is_closing: is_overview_open,
+                                    closing_inward: is_overview_open && (delta_r > 0.0),
+                                });
+                            }
+                        }
                     }
                 }
 
-                if count > 0 {
-                    let avg_dx = sum_dx / count as f64;
-                    let avg_dy = sum_dy / count as f64;
+                if gesture.gesture_type.is_none() {
+                    let mut sum_dx = 0.0;
+                    let mut sum_dy = 0.0;
+                    let mut count = 0;
+                    for (s, start_loc) in &gesture.start_locations {
+                        if let Some(last_loc) = gesture.last_locations.get(s) {
+                            let diff = *last_loc - *start_loc;
+                            sum_dx += diff.x;
+                            sum_dy += diff.y;
+                            count += 1;
+                        }
+                    }
 
-                    if avg_dx * avg_dx + avg_dy * avg_dy >= 16. * 16. {
-                        let layout = &mut self.niri.layout;
-                        if gesture.fingers >= 4 {
-                            if avg_dy.abs() > avg_dx.abs() {
-                                layout.overview_gesture_begin();
-                                gesture.gesture_type = Some(TouchscreenGestureType::Overview);
-                            }
-                        } else if gesture.fingers == 3 {
-                            if avg_dy.abs() > avg_dx.abs() {
-                                layout.workspace_switch_gesture_begin(&gesture.output, true);
-                                gesture.gesture_type =
-                                    Some(TouchscreenGestureType::WorkspaceSwitch);
-                            } else {
-                                let ws_idx =
-                                    if let Some(mon) = layout.monitor_for_output(&gesture.output) {
-                                        let ws = mon.active_workspace_ref();
-                                        Some(layout.find_workspace_by_id(ws.id()).unwrap().0)
-                                    } else {
-                                        None
-                                    };
-                                layout.view_offset_gesture_begin(&gesture.output, ws_idx, true);
-                                gesture.gesture_type = Some(TouchscreenGestureType::ViewOffset);
+                    if count > 0 {
+                        let avg_dx = sum_dx / count as f64;
+                        let avg_dy = sum_dy / count as f64;
+
+                        if avg_dx * avg_dx + avg_dy * avg_dy >= 16. * 16. {
+                            let layout = &mut self.niri.layout;
+                            if gesture.fingers >= 4 {
+                                if avg_dy.abs() > avg_dx.abs() {
+                                    layout.overview_gesture_begin();
+                                    gesture.gesture_type = Some(TouchscreenGestureType::Overview);
+                                }
+                            } else if gesture.fingers == 3 {
+                                if avg_dy.abs() > avg_dx.abs() {
+                                    layout.workspace_switch_gesture_begin(&gesture.output, true);
+                                    gesture.gesture_type =
+                                        Some(TouchscreenGestureType::WorkspaceSwitch);
+                                } else {
+                                    let ws_idx =
+                                        if let Some(mon) = layout.monitor_for_output(&gesture.output) {
+                                            let ws = mon.active_workspace_ref();
+                                            Some(layout.find_workspace_by_id(ws.id()).unwrap().0)
+                                        } else {
+                                            None
+                                        };
+                                    layout.view_offset_gesture_begin(&gesture.output, ws_idx, true);
+                                    gesture.gesture_type = Some(TouchscreenGestureType::ViewOffset);
+                                }
                             }
                         }
                     }
@@ -4572,7 +4653,37 @@ impl State {
             }
 
             if gesture.gesture_type.is_some() {
-                if let Some(old_location) = old_location {
+                if let Some(pinch) = &mut gesture.pinch_data {
+                    if let (Some(pos_c), Some(pos_a), Some(pos_b)) = (
+                        gesture.last_locations.get(&pinch.moving_slot),
+                        gesture.last_locations.get(&pinch.anchor_slots[0]),
+                        gesture.last_locations.get(&pinch.anchor_slots[1]),
+                    ) {
+                        let anchor_mid = Point::from((
+                            (pos_a.x + pos_b.x) / 2.0,
+                            (pos_a.y + pos_b.y) / 2.0,
+                        ));
+                        let diff = *pos_c - anchor_mid;
+                        let curr_dist = (diff.x * diff.x + diff.y * diff.y).sqrt();
+
+                        let step_delta = if pinch.is_closing && pinch.closing_inward {
+                            curr_dist - pinch.last_dist
+                        } else {
+                            pinch.last_dist - curr_dist
+                        };
+                        pinch.last_dist = curr_dist;
+
+                        // Responsive amplification (1.2x)
+                        let delta_pinch = step_delta * 1.2;
+
+                        handle_update = Some((
+                            Point::from((0.0, -delta_pinch)),
+                            gesture.fingers,
+                            gesture.output.clone(),
+                            gesture.start_pos,
+                        ));
+                    }
+                } else if let Some(old_location) = old_location {
                     let delta = pos - old_location;
                     let avg_delta: Point<f64, Logical> = Point::from((
                         delta.x / gesture.fingers as f64,
