@@ -3,6 +3,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use crate::niri::{TouchscreenGesture, TouchscreenGestureType};
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
@@ -284,8 +285,12 @@ impl State {
                 tablet_seat.clear_tools();
             }
         }
-        if device.has_capability(DeviceCapability::Touch) && self.niri.touch.is_empty() {
-            self.niri.seat.remove_touch();
+        if device.has_capability(DeviceCapability::Touch) {
+            self.niri.touchscreen_touches.clear();
+            self.end_touchscreen_gesture();
+            if self.niri.touch.is_empty() {
+                self.niri.seat.remove_touch();
+            }
         }
     }
 
@@ -4303,51 +4308,81 @@ impl State {
         };
         let slot = evt.slot();
 
+        self.niri.touchscreen_touches.retain(|&(s, _)| s != slot);
+        self.niri.touchscreen_touches.push((slot, pos));
+
         let serial = SERIAL_COUNTER.next_serial();
 
-        let under = self.niri.contents_under(pos);
-
-        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
-        let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
-        let mods = modifiers_from_state(mods);
-        let mod_down = mods.contains(mod_key.to_modifiers());
-
-        if self.niri.screenshot_ui.is_open() {
-            // If we'll be moving the existing selection, use the selection output.
-            let output = if mod_down {
-                self.niri.screenshot_ui.selection_output()
-            } else {
-                under.output.as_ref()
-            };
-
-            if let Some(output) = output.cloned() {
-                let geom = self.niri.global_space.output_geometry(&output).unwrap();
-                let point = (pos - geom.loc.to_f64())
-                    .to_physical(output.current_scale().fractional_scale())
-                    .to_i32_round();
-
-                if self
-                    .niri
-                    .screenshot_ui
-                    .pointer_down(output, point, Some(slot), mod_down)
-                {
-                    self.niri.queue_redraw_all();
-                }
+        if let Some(gesture) = &mut self.niri.touchscreen_gesture {
+            gesture.start_locations.insert(slot, pos);
+            gesture.last_locations.insert(slot, pos);
+            if gesture.start_locations.len() > gesture.fingers {
+                gesture.fingers = gesture.start_locations.len();
             }
-        } else if let Some(mru_output) = self.niri.window_mru_ui.output() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
-                if mru_output == output {
-                    let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
-                    if id.is_some() {
-                        self.confirm_mru();
+        } else if !self.niri.screenshot_ui.is_open() && self.niri.window_mru_ui.output().is_none() {
+            let (is_edge_touch, edge_gesture_type) = if self.niri.touchscreen_touches.len() == 1 {
+                if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                    if let Some(output_geo) = self.niri.global_space.output_geometry(&output) {
+                        let w = output_geo.size.w as f64;
+                        let h = output_geo.size.h as f64;
+                        let margin = 30.0;
+                        if pos_within_output.x <= margin || pos_within_output.x >= w - margin {
+                            (true, Some(TouchscreenGestureType::ViewOffset))
+                        } else if pos_within_output.y <= margin || pos_within_output.y >= h - margin
+                        {
+                            (true, Some(TouchscreenGestureType::WorkspaceSwitch))
+                        } else {
+                            (false, None)
+                        }
                     } else {
-                        self.niri.cancel_mru();
+                        (false, None)
                     }
                 } else {
-                    self.niri.cancel_mru();
+                    (false, None)
+                }
+            } else {
+                (false, None)
+            };
+
+            if self.niri.touchscreen_touches.len() >= 3 || is_edge_touch {
+                if let Some((output, _)) = self.niri.output_under(pos) {
+                    let output = output.clone();
+                    let fingers = self.niri.touchscreen_touches.len();
+                    let mut initial_touches = std::collections::HashMap::new();
+                    for &(s, p) in &self.niri.touchscreen_touches {
+                        initial_touches.insert(s, p);
+                    }
+                    let gesture_type = if is_edge_touch {
+                        edge_gesture_type
+                    } else {
+                        None
+                    };
+                    self.niri.touchscreen_gesture = Some(TouchscreenGesture {
+                        fingers,
+                        output,
+                        start_pos: pos,
+                        start_locations: initial_touches.clone(),
+                        last_locations: initial_touches,
+                        gesture_type,
+                    });
+
+                    if handle.is_grabbed() {
+                        handle.unset_grab(self);
+                    }
+
+                    handle.cancel(self);
                 }
             }
-        } else if !handle.is_grabbed() {
+        }
+
+        if self.niri.touchscreen_gesture.is_none() {
+            let under = self.niri.contents_under(pos);
+
+            let mod_key = self.backend.mod_key(&self.niri.config.borrow());
+            let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+            let mods = modifiers_from_state(mods);
+            let mod_down = mods.contains(mod_key.to_modifiers());
+
             if self.niri.layout.is_overview_open()
                 && !mod_down
                 && under.layer.is_none()
@@ -4410,18 +4445,18 @@ impl State {
                 self.niri.queue_redraw_all();
             }
             self.niri.focus_layer_surface_if_on_demand(under.layer);
-        };
 
-        handle.down(
-            self,
-            under.surface,
-            &DownEvent {
-                slot,
-                location: pos,
-                serial,
-                time: evt.time(),
-            },
-        );
+            handle.down(
+                self,
+                under.surface,
+                &DownEvent {
+                    slot,
+                    location: pos,
+                    serial,
+                    time: evt.time(),
+                },
+            );
+        }
 
         // We're using touch, hide the pointer.
         self.niri.pointer_visibility = PointerVisibility::Disabled;
@@ -4431,6 +4466,24 @@ impl State {
             return;
         };
         let slot = evt.slot();
+
+        self.niri.touchscreen_touches.retain(|&(s, _)| s != slot);
+
+        if self.niri.touchscreen_gesture.is_some() {
+            let mut end_gesture = false;
+            if let Some(gesture) = &mut self.niri.touchscreen_gesture {
+                gesture.start_locations.remove(&slot);
+                gesture.last_locations.remove(&slot);
+                let min_fingers = if gesture.fingers == 1 { 1 } else { 3 };
+                if gesture.last_locations.len() < min_fingers {
+                    end_gesture = true;
+                }
+            }
+            if end_gesture {
+                self.end_touchscreen_gesture();
+            }
+            return;
+        }
 
         if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
             if capture {
@@ -4458,6 +4511,99 @@ impl State {
             return;
         };
         let slot = evt.slot();
+
+        if let Some(touch) = self
+            .niri
+            .touchscreen_touches
+            .iter_mut()
+            .find(|&&mut (s, _)| s == slot)
+        {
+            touch.1 = pos;
+        }
+
+        let mut handle_update = None;
+
+        if let Some(gesture) = &mut self.niri.touchscreen_gesture {
+            let old_location = gesture.last_locations.insert(slot, pos);
+
+            if gesture.gesture_type.is_none() {
+                let mut sum_dx = 0.0;
+                let mut sum_dy = 0.0;
+                let mut count = 0;
+                for (s, start_loc) in &gesture.start_locations {
+                    if let Some(last_loc) = gesture.last_locations.get(s) {
+                        let diff = *last_loc - *start_loc;
+                        sum_dx += diff.x;
+                        sum_dy += diff.y;
+                        count += 1;
+                    }
+                }
+
+                if count > 0 {
+                    let avg_dx = sum_dx / count as f64;
+                    let avg_dy = sum_dy / count as f64;
+
+                    if avg_dx * avg_dx + avg_dy * avg_dy >= 16. * 16. {
+                        let layout = &mut self.niri.layout;
+                        if gesture.fingers >= 4 {
+                            if avg_dy.abs() > avg_dx.abs() {
+                                layout.overview_gesture_begin();
+                                gesture.gesture_type = Some(TouchscreenGestureType::Overview);
+                            }
+                        } else if gesture.fingers == 3 {
+                            if avg_dy.abs() > avg_dx.abs() {
+                                layout.workspace_switch_gesture_begin(&gesture.output, true);
+                                gesture.gesture_type =
+                                    Some(TouchscreenGestureType::WorkspaceSwitch);
+                            } else {
+                                let ws_idx =
+                                    if let Some(mon) = layout.monitor_for_output(&gesture.output) {
+                                        let ws = mon.active_workspace_ref();
+                                        Some(layout.find_workspace_by_id(ws.id()).unwrap().0)
+                                    } else {
+                                        None
+                                    };
+                                layout.view_offset_gesture_begin(&gesture.output, ws_idx, true);
+                                gesture.gesture_type = Some(TouchscreenGestureType::ViewOffset);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if gesture.gesture_type.is_some() {
+                if let Some(old_location) = old_location {
+                    let delta = pos - old_location;
+                    let avg_delta: Point<f64, Logical> = Point::from((
+                        delta.x / gesture.fingers as f64,
+                        delta.y / gesture.fingers as f64,
+                    ));
+                    handle_update = Some((
+                        avg_delta,
+                        gesture.fingers,
+                        gesture.output.clone(),
+                        gesture.start_pos,
+                    ));
+                }
+            }
+        }
+
+        if let Some((avg_delta, fingers, output, start_pos)) = handle_update {
+            let timestamp = Duration::from_micros(evt.time().micros());
+            self.handle_swipe_update(
+                avg_delta.x,
+                avg_delta.y,
+                timestamp,
+                fingers,
+                &output,
+                start_pos,
+            );
+            return;
+        }
+
+        if self.niri.touchscreen_gesture.is_some() {
+            return;
+        }
 
         if let Some(output) = self.niri.screenshot_ui.selection_output().cloned() {
             let geom = self.niri.global_space.output_geometry(&output).unwrap();
@@ -4495,13 +4641,132 @@ impl State {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        handle.frame(self);
+        if self.niri.touchscreen_gesture.is_none() {
+            handle.frame(self);
+        }
     }
     fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        handle.cancel(self);
+        self.niri.touchscreen_touches.clear();
+        if self.niri.touchscreen_gesture.is_some() {
+            self.end_touchscreen_gesture();
+        } else {
+            handle.cancel(self);
+        }
+    }
+
+    fn end_touchscreen_gesture(&mut self) {
+        if self.niri.touchscreen_gesture.take().is_some() {
+            self.handle_swipe_end();
+        }
+    }
+
+    fn handle_swipe_update(
+        &mut self,
+        delta_x: f64,
+        delta_y: f64,
+        timestamp: Duration,
+        _fingers: usize,
+        output: &Output,
+        start_pos: Point<f64, Logical>,
+    ) {
+        let active_gesture_type = self
+            .niri
+            .touchscreen_gesture
+            .as_ref()
+            .and_then(|g| g.gesture_type);
+
+        if let Some(gesture_type) = active_gesture_type {
+            match gesture_type {
+                TouchscreenGestureType::WorkspaceSwitch => {
+                    let res = self
+                        .niri
+                        .layout
+                        .workspace_switch_gesture_update(-delta_y, timestamp, true);
+                    if let Some(output) = res {
+                        if let Some(output) = output {
+                            self.niri.queue_redraw(&output);
+                        }
+                    }
+                }
+                TouchscreenGestureType::ViewOffset => {
+                    let res = self
+                        .niri
+                        .layout
+                        .view_offset_gesture_update(-delta_x, timestamp, true);
+                    if let Some(output) = res {
+                        if let Some(output) = output {
+                            self.niri.queue_redraw(&output);
+                        }
+                    }
+                }
+                TouchscreenGestureType::Overview => {
+                    let res = self
+                        .niri
+                        .layout
+                        .overview_gesture_update(-delta_y, timestamp);
+                    if let Some(redraw) = res {
+                        if redraw {
+                            self.niri.queue_redraw_all();
+                        }
+                    }
+                }
+            }
+        } else {
+            let is_overview_open = self.niri.layout.is_overview_open();
+
+            if let Some((cx, cy)) = &mut self.niri.gesture_swipe_3f_cumulative {
+                *cx += -delta_x;
+                *cy += -delta_y;
+
+                let (cx, cy) = (*cx, *cy);
+                if cx * cx + cy * cy >= 16. * 16. {
+                    self.niri.gesture_swipe_3f_cumulative = None;
+
+                    let output = output.clone();
+                    if cx.abs() > cy.abs() {
+                        let output_ws = if is_overview_open {
+                            self.niri.workspace_under(true, start_pos)
+                        } else {
+                            let mon = self.niri.layout.monitor_for_output(&output);
+                            mon.map(|mon| (output.clone(), mon.active_workspace_ref()))
+                        };
+
+                        if let Some((output, ws)) = output_ws {
+                            let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
+                            self.niri
+                                .layout
+                                .view_offset_gesture_begin(&output, Some(ws_idx), true);
+                        }
+                    } else {
+                        self.niri
+                            .layout
+                            .workspace_switch_gesture_begin(&output, true);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_swipe_end(&mut self) {
+        self.niri.gesture_swipe_3f_cumulative = None;
+
+        let res = self.niri.layout.workspace_switch_gesture_end(Some(true));
+        if let Some(output) = res {
+            self.niri.queue_redraw(&output);
+        }
+
+        let res = self.niri.layout.view_offset_gesture_end(Some(true));
+        if let Some(output) = res {
+            self.niri.queue_redraw(&output);
+        }
+
+        let res = self.niri.layout.overview_gesture_end();
+        if res {
+            self.niri.queue_redraw_all();
+        }
     }
 
     fn on_switch_toggle<I: InputBackend>(&mut self, evt: I::SwitchToggleEvent) {
@@ -4513,6 +4778,10 @@ impl State {
             let is_closed = evt.state() == SwitchState::On;
             trace!("lid switch {}", if is_closed { "closed" } else { "opened" });
             self.set_lid_closed(is_closed);
+        } else if switch == Switch::TabletMode {
+            let is_tablet = evt.state() == SwitchState::On;
+            trace!("tablet switch {}", if is_tablet { "on" } else { "off" });
+            self.set_tablet_mode(is_tablet);
         }
 
         let action = {

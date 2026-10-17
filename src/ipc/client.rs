@@ -496,6 +496,9 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                     Event::OverviewOpenedOrClosed { is_open: opened } => {
                         println!("Overview toggled: {opened}");
                     }
+                    Event::TabletModeChanged { is_tablet_mode } => {
+                        println!("Tablet mode changed: {is_tablet_mode}");
+                    }
                     Event::ConfigLoaded { failed } => {
                         let status = if failed {
                             "with an error"

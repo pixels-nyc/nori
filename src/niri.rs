@@ -113,7 +113,6 @@ use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::tablet_manager::TabletManagerState;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
-use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xdg_foreign::XdgForeignState;
 use wayland_server::protocol::wl_output::WlOutput;
@@ -159,6 +158,7 @@ use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
+use crate::protocols::virtual_keyboard::VirtualKeyboardManagerState;
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
@@ -275,9 +275,14 @@ pub struct Niri {
     /// startup, libinput will immediately send a closed event.
     pub is_lid_closed: bool,
 
+    /// Whether the device is in tablet mode (e.g. 360 convertible hinge folded).
+    pub is_tablet_mode: bool,
+
     pub devices: HashSet<input::Device>,
     pub tablets: HashMap<input::Device, TabletData>,
     pub touch: HashSet<input::Device>,
+    pub touchscreen_touches: Vec<(smithay::backend::input::TouchSlot, Point<f64, Logical>)>,
+    pub touchscreen_gesture: Option<TouchscreenGesture>,
 
     /// Output capture sessions. Kept out of the protocol state because each one needs a damage
     /// tracker and is handled in the redraw loop.
@@ -814,6 +819,16 @@ impl State {
         debug!("laptop lid {}", if is_closed { "closed" } else { "opened" });
         self.niri.is_lid_closed = is_closed;
         self.backend.on_output_config_changed(&mut self.niri);
+    }
+
+    pub fn set_tablet_mode(&mut self, is_tablet: bool) {
+        if self.niri.is_tablet_mode == is_tablet {
+            return;
+        }
+
+        debug!("tablet mode {}", if is_tablet { "enabled" } else { "disabled" });
+        self.niri.is_tablet_mode = is_tablet;
+        self.ipc_refresh_tablet_mode();
     }
 
     fn refresh(&mut self) {
@@ -1891,7 +1906,8 @@ impl State {
                 .and_then(|c| c.backdrop_color)
                 .unwrap_or(full_config.overview.backdrop_color)
                 .to_array_unpremul();
-            backdrop_color[3] = 1.;
+            // Preserve configured transparency
+            // backdrop_color[3] = 1.;
             let backdrop_color = Color32F::from(backdrop_color);
 
             if let Some(state) = self.niri.output_state.get_mut(output) {
@@ -2657,10 +2673,13 @@ impl Niri {
             blocker_cleared_rx,
             monitors_active: true,
             is_lid_closed: false,
+            is_tablet_mode: false,
 
             devices: HashSet::new(),
             tablets: HashMap::new(),
             touch: HashSet::new(),
+            touchscreen_touches: Vec::new(),
+            touchscreen_gesture: None,
 
             compositor_state,
             xdg_shell_state,
@@ -2986,7 +3005,8 @@ impl Niri {
             .and_then(|c| c.backdrop_color)
             .unwrap_or(config.overview.backdrop_color)
             .to_array_unpremul();
-        backdrop_color[3] = 1.;
+        // Preserve configured transparency
+        // backdrop_color[3] = 1.;
 
         // FIXME: fix winit damage on other transforms.
         if name.connector == "winit" {
@@ -3777,9 +3797,38 @@ impl Niri {
     pub fn output_for_touch(&self) -> Option<&Output> {
         let config = self.config.borrow();
         let map_to_output = config.input.touch.map_to_output.as_ref();
-        map_to_output
-            .and_then(|name| self.output_by_name_match(name))
-            .or_else(|| self.global_space.outputs().next())
+
+        let edp_is_off = {
+            if let Ok(home) = std::env::var("HOME") {
+                if let Some(ref name) = map_to_output {
+                    let cache_path = std::path::PathBuf::from(home).join(".cache");
+                    let brightness_file = cache_path.join(format!("{}-brightness", name));
+                    let logical_state_file = cache_path.join(format!("{}-logical-state", name));
+
+                    let brightness_is_zero = std::fs::read_to_string(&brightness_file)
+                        .map(|s| s.trim() == "0")
+                        .unwrap_or(false);
+
+                    let logical_is_off = std::fs::read_to_string(&logical_state_file)
+                        .map(|s| s.trim() == "off")
+                        .unwrap_or(false);
+
+                    brightness_is_zero || logical_is_off
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        let target_output = if edp_is_off {
+            None
+        } else {
+            map_to_output.and_then(|name| self.output_by_name_match(name))
+        };
+
+        target_output.or_else(|| self.global_space.outputs().next())
     }
 
     pub fn output_by_name_match(&self, target: &str) -> Option<&Output> {
@@ -4691,7 +4740,8 @@ impl Niri {
         layer_map.layers_on(layer).rev().filter_map(move |surface| {
             let mapped = self.mapped_layer_surfaces.get(surface)?;
 
-            if for_backdrop != mapped.place_within_backdrop() {
+            // Render place_within_backdrop surfaces in both normal and overview modes.
+            if for_backdrop && !mapped.place_within_backdrop() {
                 return None;
             }
 
@@ -7142,4 +7192,23 @@ niri_render_elements! {
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct TouchscreenGesture {
+    pub fingers: usize,
+    pub output: smithay::output::Output,
+    pub start_pos: Point<f64, Logical>,
+    pub start_locations:
+        std::collections::HashMap<smithay::backend::input::TouchSlot, Point<f64, Logical>>,
+    pub last_locations:
+        std::collections::HashMap<smithay::backend::input::TouchSlot, Point<f64, Logical>>,
+    pub gesture_type: Option<TouchscreenGestureType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TouchscreenGestureType {
+    Overview,
+    WorkspaceSwitch,
+    ViewOffset,
 }
