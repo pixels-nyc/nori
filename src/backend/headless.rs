@@ -230,11 +230,13 @@ impl Headless {
         output_state.frame_clock.presented(now);
 
         match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
-            RedrawState::Idle => unreachable!(),
+            RedrawState::Idle => (),
             RedrawState::Queued => (),
-            RedrawState::WaitingForVBlank { .. } => unreachable!(),
-            RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
-            RedrawState::WaitingForEstimatedVBlankAndQueued(_) => unreachable!(),
+            RedrawState::WaitingForVBlank { .. } => (),
+            RedrawState::WaitingForEstimatedVBlank(_) => (),
+            RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
+                output_state.redraw_state = RedrawState::Queued;
+            }
         }
 
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
