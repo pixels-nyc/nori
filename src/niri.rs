@@ -7195,6 +7195,15 @@ niri_render_elements! {
 }
 
 #[derive(Debug, Clone)]
+pub struct TouchscreenPinchData {
+    pub moving_slot: smithay::backend::input::TouchSlot,
+    pub anchor_slots: [smithay::backend::input::TouchSlot; 2],
+    pub last_dist: f64,
+    pub is_closing: bool,
+    pub closing_inward: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct TouchscreenGesture {
     pub fingers: usize,
     pub output: smithay::output::Output,
@@ -7204,6 +7213,7 @@ pub struct TouchscreenGesture {
     pub last_locations:
         std::collections::HashMap<smithay::backend::input::TouchSlot, Point<f64, Logical>>,
     pub gesture_type: Option<TouchscreenGestureType>,
+    pub pinch_data: Option<TouchscreenPinchData>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
