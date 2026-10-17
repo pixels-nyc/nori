@@ -49,7 +49,14 @@ impl Headless {
         }
     }
 
-    pub fn init(&mut self, _niri: &mut Niri) {}
+    pub fn init(&mut self, niri: &mut Niri) {
+        if let Err(err) = self.add_renderer() {
+            warn!("Headless add_renderer error: {err:#}");
+        }
+        // Spawn dual virtual outputs matching physical multi-head setup (e.g. card1-HDMI-A-1 & HDMI-A-2)
+        self.add_output(niri, 1, (1920, 1080));
+        self.add_output(niri, 2, (1920, 1080));
+    }
 
     pub fn add_renderer(&mut self) -> anyhow::Result<()> {
         if self.renderer.is_some() {
