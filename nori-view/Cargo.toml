@@ -1,0 +1,17 @@
+[package]
+name = "nori-view"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+gbm = "0.18.0"
+drm = "0.14"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+calloop = { version = "0.14.4" }
+calloop-wayland-source = "0.4.1"
+nix = { version = "0.31", features = ["fs", "user"] }

@@ -14,11 +14,12 @@ use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::ImportDma;
+use smithay::backend::renderer::{ImportDma, ImportEgl};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::utils::{DeviceFd, Size};
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
@@ -96,6 +97,7 @@ fn detect_physical_displays() -> Vec<(u16, u16)> {
 pub struct Headless {
     renderer: Option<GlesRenderer>,
     render_node: Option<DrmNode>,
+    dmabuf_global: Option<DmabufGlobal>,
     #[cfg(feature = "xdp-gnome-screencast")]
     gbm_device: Option<GbmDevice<DeviceFd>>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
@@ -108,6 +110,7 @@ impl Headless {
         Self {
             renderer: None,
             render_node: None,
+            dmabuf_global: None,
             #[cfg(feature = "xdp-gnome-screencast")]
             gbm_device: None,
             ipc_outputs: Default::default(),
@@ -119,6 +122,36 @@ impl Headless {
     pub fn init(&mut self, niri: &mut Niri) {
         if let Err(err) = self.add_renderer() {
             warn!("Headless add_renderer error: {err:#}");
+        }
+
+        if let Some(renderer) = &mut self.renderer {
+            if let Err(err) = renderer.bind_wl_display(&niri.display_handle) {
+                trace!("error binding legacy EGL to wl_display: {err}");
+            }
+        }
+
+        if let Some(renderer) = &self.renderer {
+            let default_feedback = || {
+                let node = self.render_node.as_ref().context("no render node available")?;
+                let primary_formats = renderer.dmabuf_formats();
+                DmabufFeedbackBuilder::new(node.dev_id(), primary_formats)
+                    .build()
+                    .context("error building dmabuf feedback")
+            };
+
+            let dmabuf_global = match default_feedback() {
+                Ok(feedback) => niri
+                    .dmabuf_state
+                    .create_global_with_default_feedback::<crate::niri::State>(&niri.display_handle, &feedback),
+                Err(err) => {
+                    debug!("failed building default dmabuf feedback, falling back to v3: {err:?}");
+                    let primary_formats = renderer.dmabuf_formats();
+                    niri.dmabuf_state
+                        .create_global::<crate::niri::State>(&niri.display_handle, primary_formats)
+                }
+            };
+            self.dmabuf_global = Some(dmabuf_global);
+            info!("Headless nori successfully registered zwp_linux_dmabuf_v1 global");
         }
 
         // Dynamically auto-sense physical display topology from DRM KMS
