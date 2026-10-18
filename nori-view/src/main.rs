@@ -79,9 +79,13 @@ struct Args {
     #[arg(long)]
     app_id: Option<String>,
 
-    /// Fullscreen mode on host
-    #[arg(short, long)]
+    /// Fullscreen mode on host (enabled by default)
+    #[arg(short, long, default_value_t = true)]
     fullscreen: bool,
+
+    /// Disable fullscreen mode on host (run windowed)
+    #[arg(long)]
+    windowed: bool,
 
     /// DRM render node path
     #[arg(long, default_value = "/dev/dri/renderD128")]
@@ -319,23 +323,27 @@ impl Dispatch<WlKeyboard, ()> for HostState {
                         state.shift_held = is_pressed;
                     }
 
-                    // Key 33 (F) or Key 87 (F11): Mod+Shift+F toggle fullscreen
-                    if (((key == 33 || key == 41) && state.mod_held && state.shift_held) || key == 87) && is_pressed {
-                        state.release_all_held_keys();
-                        state.is_fullscreen = !state.is_fullscreen;
-                        if let Some(toplevel) = &state.toplevel {
-                            if state.is_fullscreen {
-                                toplevel.set_fullscreen(None);
-                                println!("[nori-view] Mod+Shift+F: Toggled Fullscreen ON");
-                            } else {
-                                toplevel.unset_fullscreen();
-                                println!("[nori-view] Mod+Shift+F: Toggled Fullscreen OFF");
+                    // Mod+Shift+F is ONLY handled on host if shortcuts are NOT captive (!state.inhibitor_active).
+                    // While captive in slot, all keys (including Mod+Shift+F) are forwarded straight to Head 1!
+                    // To un-fullscreen host, user must take the path: Mod+Esc (unlock) -> Mod+Shift+F (un-fullscreen).
+                    if !state.inhibitor_active {
+                        if (((key == 33 || key == 41) && state.mod_held && state.shift_held) || key == 87) && is_pressed {
+                            state.release_all_held_keys();
+                            state.is_fullscreen = !state.is_fullscreen;
+                            if let Some(toplevel) = &state.toplevel {
+                                if state.is_fullscreen {
+                                    toplevel.set_fullscreen(None);
+                                    println!("[nori-view] Mod+Shift+F: Toggled Fullscreen ON (host navigation mode)");
+                                } else {
+                                    toplevel.unset_fullscreen();
+                                    println!("[nori-view] Mod+Shift+F: Toggled Fullscreen OFF (host navigation mode)");
+                                }
+                                if let Some(surface) = &state.surface {
+                                    surface.commit();
+                                }
                             }
-                            if let Some(surface) = &state.surface {
-                                surface.commit();
-                            }
+                            return;
                         }
-                        return;
                     }
 
                     // Forward key to target virtual keyboard
@@ -747,7 +755,8 @@ fn main() -> Result<()> {
     toplevel.set_title(window_title);
     toplevel.set_app_id(app_id);
 
-    if args.fullscreen {
+    let should_fullscreen = args.fullscreen && !args.windowed;
+    if should_fullscreen {
         toplevel.set_fullscreen(None);
         host_state.is_fullscreen = true;
     }
