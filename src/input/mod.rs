@@ -4245,7 +4245,7 @@ impl State {
                     );
                 } else if swipe.fingers == 3 {
                     if dx.abs() > dy.abs() && dx.abs() >= threshold {
-                        if dx < 0.0 {
+                        if dx > 0.0 {
                             slot_passthrough::send_slot_action(
                                 swipe.slot,
                                 swipe.node.as_deref(),
@@ -4671,7 +4671,7 @@ impl State {
                             );
                         } else if gtg.fingers == 3 {
                             if avg_dx.abs() > avg_dy.abs() && avg_dx.abs() >= threshold {
-                                if avg_dx < 0.0 {
+                                if avg_dx > 0.0 {
                                     slot_passthrough::send_slot_action(
                                         gtg.slot,
                                         gtg.node.as_deref(),
