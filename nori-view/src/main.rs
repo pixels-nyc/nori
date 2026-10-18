@@ -29,6 +29,10 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
     zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
 };
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport,
+    wp_viewporter::WpViewporter,
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_surface::{self, XdgSurface},
     xdg_toplevel::{self, XdgToplevel},
@@ -101,6 +105,8 @@ struct HostState {
     seat: Option<WlSeat>,
     inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
+    viewporter: Option<WpViewporter>,
+    viewport: Option<WpViewport>,
 
     surface: Option<WlSurface>,
     xdg_surface: Option<XdgSurface>,
@@ -154,6 +160,9 @@ impl Dispatch<WlRegistry, ()> for HostState {
                 "zwp_keyboard_shortcuts_inhibit_manager_v1" => {
                     state.inhibit_manager = Some(registry.bind(name, 1, qh, ()));
                 }
+                "wp_viewporter" => {
+                    state.viewporter = Some(registry.bind(name, 1, qh, ()));
+                }
                 _ => {}
             }
         }
@@ -176,6 +185,9 @@ impl Dispatch<XdgSurface, ()> for HostState {
     fn event(state: &mut Self, surface: &XdgSurface, event: xdg_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         if let xdg_surface::Event::Configure { serial } = event {
             surface.ack_configure(serial);
+            if let Some(vp) = &state.viewport {
+                vp.set_destination(state.width as i32, state.height as i32);
+            }
             state.configured = true;
         }
     }
@@ -188,6 +200,9 @@ impl Dispatch<XdgToplevel, ()> for HostState {
                 if width > 0 && height > 0 {
                     state.width = width as u32;
                     state.height = height as u32;
+                    if let Some(vp) = &state.viewport {
+                        vp.set_destination(width, height);
+                    }
                 }
             }
             xdg_toplevel::Event::Close => {
@@ -327,6 +342,14 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitManagerV1, ()> for HostState {
 
 impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for HostState {
     fn event(_: &mut Self, _: &ZwpKeyboardShortcutsInhibitorV1, _: wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<WpViewporter, ()> for HostState {
+    fn event(_: &mut Self, _: &WpViewporter, _: wayland_protocols::wp::viewporter::client::wp_viewporter::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<WpViewport, ()> for HostState {
+    fn event(_: &mut Self, _: &WpViewport, _: wayland_protocols::wp::viewporter::client::wp_viewport::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +570,8 @@ fn main() -> Result<()> {
         seat: None,
         inhibit_manager: None,
         inhibitor: None,
+        viewporter: None,
+        viewport: None,
         surface: None,
         xdg_surface: None,
         toplevel: None,
@@ -554,8 +579,8 @@ fn main() -> Result<()> {
         keyboard: None,
         touch: None,
         configured: false,
-        width: target_state.width,
-        height: target_state.height,
+        width: (target_state.width as f64 / 1.5).round() as u32,
+        height: (target_state.height as f64 / 1.5).round() as u32,
         pointer_events: Vec::new(),
         inhibitor_active: true,
         mod_held: false,
@@ -570,6 +595,13 @@ fn main() -> Result<()> {
     let compositor = host_state.compositor.as_ref().context("host lacks wl_compositor")?;
     let xdg_wm_base = host_state.xdg_wm_base.as_ref().context("host lacks xdg_wm_base")?;
     let host_surface = compositor.create_surface(&host_qh, ());
+
+    if let Some(viewporter) = &host_state.viewporter {
+        let vp = viewporter.get_viewport(&host_surface, &host_qh, ());
+        vp.set_destination(host_state.width as i32, host_state.height as i32);
+        host_state.viewport = Some(vp);
+    }
+
     let xdg_surface = xdg_wm_base.get_xdg_surface(&host_surface, &host_qh, ());
     let toplevel = xdg_surface.get_toplevel(&host_qh, ());
 
@@ -729,6 +761,9 @@ fn main() -> Result<()> {
             if let Some(buf_idx) = target_state.active_frame_buffer_idx.take() {
                 let host_buf = &buffers[buf_idx].host_buffer;
                 host_surface.attach(Some(host_buf), 0, 0);
+                if let Some(vp) = &host_state.viewport {
+                    vp.set_destination(host_state.width as i32, host_state.height as i32);
+                }
                 host_surface.damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
                 host_surface.commit();
                 host_conn.flush()?;
