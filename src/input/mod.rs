@@ -4259,7 +4259,7 @@ impl State {
                             );
                         }
                     } else if dy.abs() > dx.abs() && dy.abs() >= threshold {
-                        if dy < 0.0 {
+                        if dy > 0.0 {
                             slot_passthrough::send_slot_action(
                                 swipe.slot,
                                 swipe.node.as_deref(),
@@ -4685,7 +4685,7 @@ impl State {
                                     );
                                 }
                             } else if avg_dy.abs() > avg_dx.abs() && avg_dy.abs() >= threshold {
-                                if avg_dy < 0.0 {
+                                if avg_dy > 0.0 {
                                     slot_passthrough::send_slot_action(
                                         gtg.slot,
                                         gtg.node.as_deref(),
