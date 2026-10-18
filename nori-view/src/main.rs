@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -122,11 +123,29 @@ struct HostState {
 
     pointer_events: Vec<PointerEvent>,
     keyboard_events: Vec<KeyboardEvent>,
+    held_keys: HashSet<u32>,
     inhibitor_active: bool,
     mod_held: bool,
     shift_held: bool,
     is_fullscreen: bool,
     closed: bool,
+}
+
+impl HostState {
+    fn release_all_held_keys(&mut self) {
+        if !self.held_keys.is_empty() {
+            println!("[nori-view] Releasing all {} held keys on slot", self.held_keys.len());
+            for key in self.held_keys.drain() {
+                self.keyboard_events.push(KeyboardEvent::Key {
+                    time: 0,
+                    key,
+                    state: 0,
+                });
+            }
+        }
+        self.mod_held = false;
+        self.shift_held = false;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +306,12 @@ impl Dispatch<WlKeyboard, ()> for HostState {
                     let is_pressed = kstate == KeyState::Pressed;
                     let state_val = if is_pressed { 1 } else { 0 };
 
+                    if is_pressed {
+                        state.held_keys.insert(key);
+                    } else {
+                        state.held_keys.remove(&key);
+                    }
+
                     // Direct keycode tracking for Super (125/126) and Shift (42/54)
                     if key == 125 || key == 126 {
                         state.mod_held = is_pressed;
@@ -296,6 +321,7 @@ impl Dispatch<WlKeyboard, ()> for HostState {
 
                     // Key 33 (F) or Key 87 (F11): Mod+Shift+F toggle fullscreen
                     if (((key == 33 || key == 41) && state.mod_held && state.shift_held) || key == 87) && is_pressed {
+                        state.release_all_held_keys();
                         state.is_fullscreen = !state.is_fullscreen;
                         if let Some(toplevel) = &state.toplevel {
                             if state.is_fullscreen {
@@ -312,7 +338,7 @@ impl Dispatch<WlKeyboard, ()> for HostState {
                         return;
                     }
 
-                    // Forward all other keys to target virtual keyboard
+                    // Forward key to target virtual keyboard
                     state.keyboard_events.push(KeyboardEvent::Key {
                         time,
                         key,
@@ -323,12 +349,46 @@ impl Dispatch<WlKeyboard, ()> for HostState {
             wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
                 state.shift_held = (mods_depressed & 0x01) != 0;
                 state.mod_held = (mods_depressed & 0x40) != 0 || (mods_depressed & 0x08) != 0;
+
+                // Auto-unstick modifiers: if host reports a modifier is no longer depressed,
+                // immediately emit a release event for it to target slot so it never gets stuck.
+                let mut stuck_keys = Vec::new();
+                if (mods_depressed & 0x01) == 0 {
+                    if state.held_keys.remove(&42) { stuck_keys.push(42); }
+                    if state.held_keys.remove(&54) { stuck_keys.push(54); }
+                }
+                if (mods_depressed & 0x04) == 0 {
+                    if state.held_keys.remove(&29) { stuck_keys.push(29); }
+                    if state.held_keys.remove(&97) { stuck_keys.push(97); }
+                }
+                if (mods_depressed & 0x08) == 0 {
+                    if state.held_keys.remove(&56) { stuck_keys.push(56); }
+                    if state.held_keys.remove(&100) { stuck_keys.push(100); }
+                }
+                if (mods_depressed & 0x40) == 0 {
+                    if state.held_keys.remove(&125) { stuck_keys.push(125); }
+                    if state.held_keys.remove(&126) { stuck_keys.push(126); }
+                }
+
+                for key in stuck_keys {
+                    println!("[nori-view] Auto-unsticking modifier key {}", key);
+                    state.keyboard_events.push(KeyboardEvent::Key {
+                        time: 0,
+                        key,
+                        state: 0,
+                    });
+                }
+
                 state.keyboard_events.push(KeyboardEvent::Modifiers {
                     depressed: mods_depressed,
                     latched: mods_latched,
                     locked: mods_locked,
                     group,
                 });
+            }
+            wl_keyboard::Event::Leave { .. } => {
+                println!("[nori-view] Focus Leave: releasing all held keys");
+                state.release_all_held_keys();
             }
             _ => {}
         }
@@ -389,6 +449,7 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for HostState {
             }
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => {
                 state.inhibitor_active = false;
+                state.release_all_held_keys();
                 println!("[nori-view] Shortcuts inhibitor: INACTIVE (released to host)");
             }
             _ => {}
@@ -654,6 +715,7 @@ fn main() -> Result<()> {
         height: (target_state.height as f64 / 1.5).round() as u32,
         pointer_events: Vec::new(),
         keyboard_events: Vec::new(),
+        held_keys: HashSet::new(),
         inhibitor_active: true,
         mod_held: false,
         shift_held: false,
