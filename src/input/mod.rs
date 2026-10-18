@@ -67,6 +67,7 @@ pub mod scroll_tracker;
 pub mod spatial_movement_grab;
 pub mod swipe_tracker;
 pub mod touch_overview_grab;
+pub mod slot_passthrough;
 
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
@@ -412,6 +413,75 @@ impl State {
                     .get(surface)
             })
             .is_some_and(KeyboardShortcutsInhibitor::is_active)
+    }
+
+    fn is_inhibiting_gestures(&self) -> bool {
+        if self.is_inhibiting_shortcuts() {
+            return true;
+        }
+
+        if let Some(surface) = self.niri.keyboard_focus.surface() {
+            let root = self.niri.find_root_shell_surface(surface);
+            if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&root) {
+                let (app_id, title) = crate::utils::with_toplevel_role(mapped.toplevel(), |role| {
+                    (role.app_id.clone(), role.title.clone())
+                });
+                if let Some(app_id) = app_id {
+                    if app_id.starts_with("nori-viewer") || app_id.starts_with("wlvncc") {
+                        return true;
+                    }
+                }
+                if title.as_deref().unwrap_or("").contains("nori-viewer") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn is_surface_inhibiting_gestures(&self, surface: &WlSurface) -> bool {
+        if self
+            .niri
+            .keyboard_shortcuts_inhibiting_surfaces
+            .get(surface)
+            .is_some_and(KeyboardShortcutsInhibitor::is_active)
+        {
+            return true;
+        }
+        let root = self.niri.find_root_shell_surface(surface);
+        if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&root) {
+            let (app_id, title) = crate::utils::with_toplevel_role(mapped.toplevel(), |role| {
+                (role.app_id.clone(), role.title.clone())
+            });
+            if let Some(app_id) = app_id {
+                if app_id.starts_with("nori-viewer") || app_id.starts_with("wlvncc") {
+                    return true;
+                }
+            }
+            if title.as_deref().unwrap_or("").contains("nori-viewer") {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn focused_slot_info(&self) -> Option<slot_passthrough::TargetSlotInfo> {
+        let surface = self.niri.keyboard_focus.surface()?;
+        let root = self.niri.find_root_shell_surface(surface);
+        let (mapped, _) = self.niri.layout.find_window_and_output(&root)?;
+        let (app_id, title) = crate::utils::with_toplevel_role(mapped.toplevel(), |role| {
+            (role.app_id.clone(), role.title.clone())
+        });
+        slot_passthrough::parse_slot_info(app_id.as_deref(), title.as_deref().unwrap_or(""))
+    }
+
+    fn surface_slot_info(&self, surface: &WlSurface) -> Option<slot_passthrough::TargetSlotInfo> {
+        let root = self.niri.find_root_shell_surface(surface);
+        let (mapped, _) = self.niri.layout.find_window_and_output(&root)?;
+        let (app_id, title) = crate::utils::with_toplevel_role(mapped.toplevel(), |role| {
+            (role.app_id.clone(), role.title.clone())
+        });
+        slot_passthrough::parse_slot_info(app_id.as_deref(), title.as_deref().unwrap_or(""))
     }
 
     fn on_keyboard<I: InputBackend>(
@@ -3970,17 +4040,28 @@ impl State {
             return;
         }
 
-        if event.fingers() == 3 {
-            self.niri.gesture_swipe_3f_cumulative = Some((0., 0.));
+        let is_inhibited = self.is_inhibiting_gestures();
 
-            // We handled this event.
-            return;
-        } else if event.fingers() == 4 {
-            self.niri.layout.overview_gesture_begin();
-            self.niri.queue_redraw_all();
+        if !is_inhibited {
+            if event.fingers() == 3 {
+                self.niri.gesture_swipe_3f_cumulative = Some((0., 0.));
 
-            // We handled this event.
-            return;
+                // We handled this event.
+                return;
+            } else if event.fingers() == 4 {
+                self.niri.layout.overview_gesture_begin();
+                self.niri.queue_redraw_all();
+
+                // We handled this event.
+                return;
+            }
+        } else if let Some(target) = self.focused_slot_info() {
+            self.niri.guest_gesture_swipe = Some(slot_passthrough::GuestGestureSwipe {
+                slot: target.slot,
+                node: target.node,
+                delta: (0.0, 0.0),
+                fingers: event.fingers(),
+            });
         }
 
         let serial = SERIAL_COUNTER.next_serial();
@@ -4026,84 +4107,91 @@ impl State {
             }
         }
 
-        let is_overview_open = self.niri.layout.is_overview_open();
+        let is_inhibited = self.is_inhibiting_gestures();
 
-        if let Some((cx, cy)) = &mut self.niri.gesture_swipe_3f_cumulative {
-            *cx += delta_x;
-            *cy += delta_y;
+        if !is_inhibited {
+            let is_overview_open = self.niri.layout.is_overview_open();
 
-            // Check if the gesture moved far enough to decide. Threshold copied from GNOME Shell.
-            let (cx, cy) = (*cx, *cy);
-            if cx * cx + cy * cy >= 16. * 16. {
-                self.niri.gesture_swipe_3f_cumulative = None;
+            if let Some((cx, cy)) = &mut self.niri.gesture_swipe_3f_cumulative {
+                *cx += delta_x;
+                *cy += delta_y;
 
-                if let Some(output) = self.niri.output_under_cursor() {
-                    if cx.abs() > cy.abs() {
-                        let output_ws = if is_overview_open {
-                            self.niri.workspace_under_cursor(true)
+                // Check if the gesture moved far enough to decide. Threshold copied from GNOME Shell.
+                let (cx, cy) = (*cx, *cy);
+                if cx * cx + cy * cy >= 16. * 16. {
+                    self.niri.gesture_swipe_3f_cumulative = None;
+
+                    if let Some(output) = self.niri.output_under_cursor() {
+                        if cx.abs() > cy.abs() {
+                            let output_ws = if is_overview_open {
+                                self.niri.workspace_under_cursor(true)
+                            } else {
+                                // We don't want to accidentally "catch" the wrong workspace during
+                                // animations.
+                                self.niri.output_under_cursor().and_then(|output| {
+                                    let mon = self.niri.layout.monitor_for_output(&output)?;
+                                    Some((output, mon.active_workspace_ref()))
+                                })
+                            };
+
+                            if let Some((output, ws)) = output_ws {
+                                let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
+                                self.niri
+                                    .layout
+                                    .view_offset_gesture_begin(&output, Some(ws_idx), true);
+                            }
                         } else {
-                            // We don't want to accidentally "catch" the wrong workspace during
-                            // animations.
-                            self.niri.output_under_cursor().and_then(|output| {
-                                let mon = self.niri.layout.monitor_for_output(&output)?;
-                                Some((output, mon.active_workspace_ref()))
-                            })
-                        };
-
-                        if let Some((output, ws)) = output_ws {
-                            let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
                             self.niri
                                 .layout
-                                .view_offset_gesture_begin(&output, Some(ws_idx), true);
+                                .workspace_switch_gesture_begin(&output, true);
                         }
-                    } else {
-                        self.niri
-                            .layout
-                            .workspace_switch_gesture_begin(&output, true);
                     }
                 }
             }
-        }
 
-        let timestamp = Duration::from_micros(event.time().micros());
+            let timestamp = Duration::from_micros(event.time().micros());
 
-        let mut handled = false;
-        let res = self
-            .niri
-            .layout
-            .workspace_switch_gesture_update(delta_y, timestamp, true);
-        if let Some(output) = res {
-            if let Some(output) = output {
-                self.niri.queue_redraw(&output);
+            let mut handled = false;
+            let res = self
+                .niri
+                .layout
+                .workspace_switch_gesture_update(delta_y, timestamp, true);
+            if let Some(output) = res {
+                if let Some(output) = output {
+                    self.niri.queue_redraw(&output);
+                }
+                handled = true;
             }
-            handled = true;
-        }
 
-        let res = self
-            .niri
-            .layout
-            .view_offset_gesture_update(delta_x, timestamp, true);
-        if let Some(output) = res {
-            if let Some(output) = output {
-                self.niri.queue_redraw(&output);
+            let res = self
+                .niri
+                .layout
+                .view_offset_gesture_update(delta_x, timestamp, true);
+            if let Some(output) = res {
+                if let Some(output) = output {
+                    self.niri.queue_redraw(&output);
+                }
+                handled = true;
             }
-            handled = true;
-        }
 
-        let res = self
-            .niri
-            .layout
-            .overview_gesture_update(-uninverted_delta_y, timestamp);
-        if let Some(redraw) = res {
-            if redraw {
-                self.niri.queue_redraw_all();
+            let res = self
+                .niri
+                .layout
+                .overview_gesture_update(-uninverted_delta_y, timestamp);
+            if let Some(redraw) = res {
+                if redraw {
+                    self.niri.queue_redraw_all();
+                }
+                handled = true;
             }
-            handled = true;
-        }
 
-        if handled {
-            // We handled this event.
-            return;
+            if handled {
+                // We handled this event.
+                return;
+            }
+        } else if let Some(swipe) = &mut self.niri.guest_gesture_swipe {
+            swipe.delta.0 += delta_x;
+            swipe.delta.1 += delta_y;
         }
 
         let pointer = self.niri.seat.get_pointer().unwrap();
@@ -4124,28 +4212,74 @@ impl State {
     fn on_gesture_swipe_end<I: InputBackend>(&mut self, event: I::GestureSwipeEndEvent) {
         self.niri.gesture_swipe_3f_cumulative = None;
 
-        let mut handled = false;
-        let res = self.niri.layout.workspace_switch_gesture_end(Some(true));
-        if let Some(output) = res {
-            self.niri.queue_redraw(&output);
-            handled = true;
-        }
+        let is_inhibited = self.is_inhibiting_gestures();
 
-        let res = self.niri.layout.view_offset_gesture_end(Some(true));
-        if let Some(output) = res {
-            self.niri.queue_redraw(&output);
-            handled = true;
-        }
+        if !is_inhibited {
+            let mut handled = false;
+            let res = self.niri.layout.workspace_switch_gesture_end(Some(true));
+            if let Some(output) = res {
+                self.niri.queue_redraw(&output);
+                handled = true;
+            }
 
-        let res = self.niri.layout.overview_gesture_end();
-        if res {
-            self.niri.queue_redraw_all();
-            handled = true;
-        }
+            let res = self.niri.layout.view_offset_gesture_end(Some(true));
+            if let Some(output) = res {
+                self.niri.queue_redraw(&output);
+                handled = true;
+            }
 
-        if handled {
-            // We handled this event.
-            return;
+            let res = self.niri.layout.overview_gesture_end();
+            if res {
+                self.niri.queue_redraw_all();
+                handled = true;
+            }
+
+            if handled {
+                // We handled this event.
+                return;
+            }
+        } else if let Some(swipe) = self.niri.guest_gesture_swipe.take() {
+            if !event.cancelled() {
+                let (dx, dy) = swipe.delta;
+                let threshold = 25.0;
+                if swipe.fingers == 4 {
+                    slot_passthrough::send_slot_action(
+                        swipe.slot,
+                        swipe.node.as_deref(),
+                        "toggle-overview",
+                    );
+                } else if swipe.fingers == 3 {
+                    if dx.abs() > dy.abs() && dx.abs() >= threshold {
+                        if dx < 0.0 {
+                            slot_passthrough::send_slot_action(
+                                swipe.slot,
+                                swipe.node.as_deref(),
+                                "focus-column-right",
+                            );
+                        } else {
+                            slot_passthrough::send_slot_action(
+                                swipe.slot,
+                                swipe.node.as_deref(),
+                                "focus-column-left",
+                            );
+                        }
+                    } else if dy.abs() > dx.abs() && dy.abs() >= threshold {
+                        if dy < 0.0 {
+                            slot_passthrough::send_slot_action(
+                                swipe.slot,
+                                swipe.node.as_deref(),
+                                "focus-workspace-down",
+                            );
+                        } else {
+                            slot_passthrough::send_slot_action(
+                                swipe.slot,
+                                swipe.node.as_deref(),
+                                "focus-workspace-up",
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         let serial = SERIAL_COUNTER.next_serial();
@@ -4313,13 +4447,21 @@ impl State {
 
         let serial = SERIAL_COUNTER.next_serial();
 
+        let surface_under = self.niri.contents_under(pos).surface;
+        let is_inhibited = surface_under
+            .as_ref()
+            .map_or(false, |(s, _)| self.is_surface_inhibiting_gestures(s));
+
         if let Some(gesture) = &mut self.niri.touchscreen_gesture {
             gesture.start_locations.insert(slot, pos);
             gesture.last_locations.insert(slot, pos);
             if gesture.start_locations.len() > gesture.fingers {
                 gesture.fingers = gesture.start_locations.len();
             }
-        } else if !self.niri.screenshot_ui.is_open() && self.niri.window_mru_ui.output().is_none() {
+        } else if !is_inhibited
+            && !self.niri.screenshot_ui.is_open()
+            && self.niri.window_mru_ui.output().is_none()
+        {
             let (is_edge_touch, edge_gesture_type) = if self.niri.touchscreen_touches.len() == 1 {
                 if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
                     if let Some(output_geo) = self.niri.global_space.output_geometry(&output) {
@@ -4372,6 +4514,26 @@ impl State {
                     }
 
                     handle.cancel(self);
+                }
+            }
+        } else if is_inhibited {
+            if let Some(target) = surface_under.as_ref().and_then(|(s, _)| self.surface_slot_info(s)) {
+                if let Some(gtg) = &mut self.niri.guest_touch_gesture {
+                    gtg.start_touches.insert(slot, pos);
+                    gtg.last_touches.insert(slot, pos);
+                    if gtg.start_touches.len() > gtg.fingers {
+                        gtg.fingers = gtg.start_touches.len();
+                    }
+                } else {
+                    let mut start_touches = std::collections::HashMap::new();
+                    start_touches.insert(slot, pos);
+                    self.niri.guest_touch_gesture = Some(slot_passthrough::GuestTouchGesture {
+                        slot: target.slot,
+                        node: target.node,
+                        start_touches: start_touches.clone(),
+                        last_touches: start_touches,
+                        fingers: 1,
+                    });
                 }
             }
         }
@@ -4486,6 +4648,69 @@ impl State {
             return;
         }
 
+        if let Some(gtg) = &mut self.niri.guest_touch_gesture {
+            let remaining_touches = self.niri.touchscreen_touches.len();
+            if remaining_touches == 0 || gtg.fingers >= 3 {
+                if gtg.fingers >= 3 {
+                    let mut sum_dx = 0.0;
+                    let mut sum_dy = 0.0;
+                    let mut count = 0;
+                    for (s, start) in &gtg.start_touches {
+                        if let Some(last) = gtg.last_touches.get(s) {
+                            sum_dx += last.x - start.x;
+                            sum_dy += last.y - start.y;
+                            count += 1;
+                        }
+                    }
+
+                    if count >= 3 {
+                        let avg_dx = sum_dx / count as f64;
+                        let avg_dy = sum_dy / count as f64;
+                        let threshold = 30.0;
+
+                        if gtg.fingers >= 4 {
+                            slot_passthrough::send_slot_action(
+                                gtg.slot,
+                                gtg.node.as_deref(),
+                                "toggle-overview",
+                            );
+                        } else if gtg.fingers == 3 {
+                            if avg_dx.abs() > avg_dy.abs() && avg_dx.abs() >= threshold {
+                                if avg_dx < 0.0 {
+                                    slot_passthrough::send_slot_action(
+                                        gtg.slot,
+                                        gtg.node.as_deref(),
+                                        "focus-column-right",
+                                    );
+                                } else {
+                                    slot_passthrough::send_slot_action(
+                                        gtg.slot,
+                                        gtg.node.as_deref(),
+                                        "focus-column-left",
+                                    );
+                                }
+                            } else if avg_dy.abs() > avg_dx.abs() && avg_dy.abs() >= threshold {
+                                if avg_dy < 0.0 {
+                                    slot_passthrough::send_slot_action(
+                                        gtg.slot,
+                                        gtg.node.as_deref(),
+                                        "focus-workspace-down",
+                                    );
+                                } else {
+                                    slot_passthrough::send_slot_action(
+                                        gtg.slot,
+                                        gtg.node.as_deref(),
+                                        "focus-workspace-up",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                self.niri.guest_touch_gesture = None;
+            }
+        }
+
         if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
             if capture {
                 self.confirm_screenshot(true);
@@ -4520,6 +4745,10 @@ impl State {
             .find(|&&mut (s, _)| s == slot)
         {
             touch.1 = pos;
+        }
+
+        if let Some(gtg) = &mut self.niri.guest_touch_gesture {
+            gtg.last_touches.insert(slot, pos);
         }
 
         let mut handle_update = None;
