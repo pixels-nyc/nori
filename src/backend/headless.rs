@@ -26,6 +26,73 @@ use crate::niri::{Niri, RedrawState};
 use crate::render_helpers::{resources, shaders};
 use crate::utils::{get_monotonic_time, logical_output};
 
+fn detect_physical_displays() -> Vec<(u16, u16)> {
+    // Check manual override first: NORI_HEADS or NORI_HEADLESS_HEADS
+    if let Ok(heads_str) = std::env::var("NORI_HEADS").or_else(|_| std::env::var("NORI_HEADLESS_HEADS")) {
+        if let Ok(count) = heads_str.trim().parse::<usize>() {
+            if count > 0 {
+                return vec![(1920, 1080); count];
+            }
+        }
+    }
+
+    let mut displays = Vec::new();
+    let drm_path = std::path::Path::new("/sys/class/drm");
+    if let Ok(entries) = std::fs::read_dir(drm_path) {
+        let mut conn_entries: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                name.starts_with("card") && name.contains('-')
+            })
+            .collect();
+        conn_entries.sort();
+
+        for conn_dir in conn_entries {
+            let conn_name = conn_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // Filter out Virtual and Writeback connectors (from vkms or faux drivers)
+            if conn_name.contains("Virtual") || conn_name.contains("Writeback") {
+                continue;
+            }
+
+            // Check if underlying device is vkms or faux
+            if let Ok(dev_target) = std::fs::read_link(conn_dir.join("device")) {
+                let dev_str = dev_target.to_string_lossy();
+                if dev_str.contains("vkms") || dev_str.contains("faux") {
+                    continue;
+                }
+            }
+
+            // Check if status is "connected"
+            let status_path = conn_dir.join("status");
+            if let Ok(status) = std::fs::read_to_string(status_path) {
+                if status.trim() == "connected" {
+                    let mut res = (1920, 1080);
+                    let modes_path = conn_dir.join("modes");
+                    if let Ok(modes_str) = std::fs::read_to_string(modes_path) {
+                        if let Some(first_mode) = modes_str.lines().next() {
+                            let parts: Vec<&str> = first_mode.trim().split('x').collect();
+                            if parts.len() == 2 {
+                                if let (Ok(w), Ok(h)) = (parts[0].parse::<u16>(), parts[1].parse::<u16>()) {
+                                    res = (w, h);
+                                }
+                            }
+                        }
+                    }
+                    displays.push(res);
+                }
+            }
+        }
+    }
+
+    if displays.is_empty() {
+        displays.push((1920, 1080));
+    }
+    displays
+}
+
 pub struct Headless {
     renderer: Option<GlesRenderer>,
     render_node: Option<DrmNode>,
@@ -53,9 +120,19 @@ impl Headless {
         if let Err(err) = self.add_renderer() {
             warn!("Headless add_renderer error: {err:#}");
         }
-        // Spawn dual virtual outputs matching physical multi-head setup (e.g. card1-HDMI-A-1 & HDMI-A-2)
-        self.add_output(niri, 1, (1920, 1080));
-        self.add_output(niri, 2, (1920, 1080));
+
+        // Dynamically auto-sense physical display topology from DRM KMS
+        // Fallback to NORI_HEADS / NORI_HEADLESS_HEADS env if provided
+        let displays = detect_physical_displays();
+        info!(
+            "Headless nori auto-detected {} physical display(s): {:?}",
+            displays.len(),
+            displays
+        );
+        for (idx, size) in displays.into_iter().enumerate() {
+            let n = (idx + 1) as u8;
+            self.add_output(niri, n, size);
+        }
     }
 
     pub fn add_renderer(&mut self) -> anyhow::Result<()> {
