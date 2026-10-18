@@ -294,13 +294,55 @@ impl Headless {
         let now = get_monotonic_time();
 
         // Dual-State Adaptive Frame Clock:
-        // Detached = 5 Hz standby software tick (200ms) to ensure <1% CPU and bounded VRAM
-        // Active = 60 Hz (16.66ms) when screencopy (waypipe, wayvnc, nori-0) is actively reading frames
-        let is_viewer_attached = self.forced_active || niri.screencopy_state.has_active_cast();
+        // Standby = Default 1 Hz software tick (NORI_STANDBY_FPS) to ensure <0.1% CPU and bounded VRAM
+        // Active = Default 60 Hz (NORI_ACTIVE_FPS) when viewer/screencopy (nori-view, waypipe, wayvnc) or agent burst is active
+        let standby_fps: u64 = std::env::var("NORI_STANDBY_FPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let mut active_fps: u64 = std::env::var("NORI_ACTIVE_FPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+
+        // Check for agent burst trigger file /run/user/{uid}/nori-burst-{slot}
+        let mut burst_active = false;
+        if let Ok(slot_str) = std::env::var("NORI_HEADLESS_SLOT").or_else(|_| std::env::var("PIXOS_HEAD")) {
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+                .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+            let burst_path = format!("{}/nori-burst-{}", runtime_dir, slot_str);
+            if let Ok(content) = std::fs::read_to_string(&burst_path) {
+                // Format: "<expires_epoch_millis> [target_fps]"
+                let parts: Vec<&str> = content.split_whitespace().collect();
+                if let Some(exp_str) = parts.first() {
+                    if let Ok(exp_ms) = exp_str.parse::<u128>() {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        if now_ms < exp_ms {
+                            burst_active = true;
+                            if let Some(fps_str) = parts.get(1) {
+                                if let Ok(f) = fps_str.parse::<u64>() {
+                                    active_fps = f.max(1);
+                                }
+                            }
+                        } else {
+                            let _ = std::fs::remove_file(&burst_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        let standby_interval = Duration::from_millis(1000 / standby_fps.max(1));
+        let active_interval = Duration::from_millis(1000 / active_fps.max(1));
+
+        let is_viewer_attached = self.forced_active || burst_active || niri.screencopy_state.has_active_cast();
         let target_interval = if is_viewer_attached {
-            Duration::from_millis(16)
+            active_interval
         } else {
-            Duration::from_millis(200)
+            standby_interval
         };
 
         if let Some(last_time) = self.last_render_time {
