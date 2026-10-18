@@ -123,6 +123,8 @@ struct HostState {
     pointer_events: Vec<PointerEvent>,
     inhibitor_active: bool,
     mod_held: bool,
+    shift_held: bool,
+    is_fullscreen: bool,
     closed: bool,
 }
 
@@ -203,6 +205,9 @@ impl Dispatch<XdgToplevel, ()> for HostState {
                     if let Some(vp) = &state.viewport {
                         vp.set_destination(width, height);
                     }
+                    if let Some(surface) = &state.surface {
+                        surface.commit();
+                    }
                 }
             }
             xdg_toplevel::Event::Close => {
@@ -268,26 +273,58 @@ impl Dispatch<WlPointer, ()> for HostState {
 }
 
 impl Dispatch<WlKeyboard, ()> for HostState {
-    fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         match event {
             wl_keyboard::Event::Key { key, state: kstate, .. } => {
                 if let WEnum::Value(kstate) = kstate {
-                    // Key 1 is KEY_ESC, Key 125 is KEY_LEFTMETA (Super)
-                    if key == 1 && state.mod_held && kstate == KeyState::Pressed {
-                        // Mod+Esc escape chord: toggle shortcuts inhibitor
+                    let is_pressed = kstate == KeyState::Pressed;
+
+                    // Direct keycode tracking for Super (125/126) and Shift (42/54)
+                    if key == 125 || key == 126 {
+                        state.mod_held = is_pressed;
+                    } else if key == 42 || key == 54 {
+                        state.shift_held = is_pressed;
+                    }
+
+                    // Key 33 (F) or Key 87 (F11): Mod+Shift+F toggle fullscreen
+                    if (((key == 33 || key == 41) && state.mod_held && state.shift_held) || key == 87) && is_pressed {
+                        state.is_fullscreen = !state.is_fullscreen;
+                        if let Some(toplevel) = &state.toplevel {
+                            if state.is_fullscreen {
+                                toplevel.set_fullscreen(None);
+                                println!("[nori-view] Mod+Shift+F: Toggled Fullscreen ON");
+                            } else {
+                                toplevel.unset_fullscreen();
+                                println!("[nori-view] Mod+Shift+F: Toggled Fullscreen OFF");
+                            }
+                            if let Some(surface) = &state.surface {
+                                surface.commit();
+                            }
+                        }
+                        return;
+                    }
+
+                    // Key 1 is KEY_ESC: Mod+Esc escape chord: toggle shortcuts inhibitor
+                    if key == 1 && state.mod_held && is_pressed {
                         state.inhibitor_active = !state.inhibitor_active;
                         if let Some(inhibitor) = &state.inhibitor {
                             if !state.inhibitor_active {
                                 inhibitor.destroy();
                                 state.inhibitor = None;
-                                println!("[nori-view] Focus Escape: Host navigation unlocked");
+                                println!("[nori-view] Focus Escape: Host navigation unlocked (shortcuts enabled)");
+                            }
+                        } else if state.inhibitor_active {
+                            if let (Some(inhibit_mgr), Some(seat), Some(surface)) = (&state.inhibit_manager, &state.seat, &state.surface) {
+                                state.inhibitor = Some(inhibit_mgr.inhibit_shortcuts(surface, seat, qh, ()));
+                                println!("[nori-view] Focus Lock: Shortcuts inhibited for slot");
                             }
                         }
+                        return;
                     }
                 }
             }
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
-                // Check if Mod4 (Super) or Alt is depressed
+                state.shift_held = (mods_depressed & 0x01) != 0;
                 state.mod_held = (mods_depressed & 0x40) != 0 || (mods_depressed & 0x08) != 0;
             }
             _ => {}
@@ -439,14 +476,16 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for TargetState {
 }
 
 impl Dispatch<ZwlrScreencopyFrameV1, usize> for TargetState {
-    fn event(state: &mut Self, _: &ZwlrScreencopyFrameV1, event: zwlr_screencopy_frame_v1::Event, buffer_idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
+    fn event(state: &mut Self, frame: &ZwlrScreencopyFrameV1, event: zwlr_screencopy_frame_v1::Event, buffer_idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
         match event {
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
                 state.frame_ready = true;
                 state.active_frame_buffer_idx = Some(*buffer_idx);
+                frame.destroy();
             }
             zwlr_screencopy_frame_v1::Event::Failed => {
                 state.frame_failed = true;
+                frame.destroy();
             }
             _ => {}
         }
@@ -584,6 +623,8 @@ fn main() -> Result<()> {
         pointer_events: Vec::new(),
         inhibitor_active: true,
         mod_held: false,
+        shift_held: false,
+        is_fullscreen: false,
         closed: false,
     };
 
@@ -613,6 +654,7 @@ fn main() -> Result<()> {
 
     if args.fullscreen {
         toplevel.set_fullscreen(None);
+        host_state.is_fullscreen = true;
     }
 
     // Inhibit host keyboard shortcuts when focused so Mod hotkeys reach slot
@@ -746,13 +788,38 @@ fn main() -> Result<()> {
 
             let target_buf = &buffers[buf_idx].target_buffer;
             let frame = screencopy_mgr.capture_output(0, &target_output, &target_qh, buf_idx);
-            frame.copy(target_buf);
+            frame.copy_with_damage(target_buf);
             current_frame = Some(frame);
             target_conn.flush()?;
         }
 
-        // Dispatch target events (screencopy frame ready)
-        target_queue.blocking_dispatch(&mut target_state)?;
+        // Flush pending requests to both compositors
+        host_conn.flush()?;
+        target_conn.flush()?;
+
+        let host_guard = host_conn.prepare_read();
+        let target_guard = target_conn.prepare_read();
+
+        if let (Some(hg), Some(tg)) = (host_guard, target_guard) {
+            let mut poll_fds = [
+                nix::poll::PollFd::new(hg.connection_fd(), nix::poll::PollFlags::POLLIN),
+                nix::poll::PollFd::new(tg.connection_fd(), nix::poll::PollFlags::POLLIN),
+            ];
+            let _ = nix::poll::poll(&mut poll_fds, nix::poll::PollTimeout::from(16u16));
+            let host_revents = poll_fds[0].revents().unwrap_or(nix::poll::PollFlags::empty());
+            let target_revents = poll_fds[1].revents().unwrap_or(nix::poll::PollFlags::empty());
+            drop(poll_fds);
+
+            if host_revents.intersects(nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLHUP | nix::poll::PollFlags::POLLERR) {
+                let _ = hg.read();
+            }
+            if target_revents.intersects(nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLHUP | nix::poll::PollFlags::POLLERR) {
+                let _ = tg.read();
+            }
+        }
+
+        // Dispatch target events (e.g. screencopy frame ready)
+        target_queue.dispatch_pending(&mut target_state)?;
 
         if target_state.frame_ready {
             target_state.frame_ready = false;

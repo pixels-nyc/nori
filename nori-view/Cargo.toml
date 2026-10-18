@@ -14,4 +14,4 @@ wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 calloop = { version = "0.14.4" }
 calloop-wayland-source = "0.4.1"
-nix = { version = "0.31", features = ["fs", "user"] }
+nix = { version = "0.31", features = ["fs", "user", "poll"] }
