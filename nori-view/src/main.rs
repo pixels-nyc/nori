@@ -133,6 +133,8 @@ struct HostState {
     shift_held: bool,
     buffer_busy: Vec<bool>,
     is_fullscreen: bool,
+    is_focused: bool,
+    last_unfocused_capture: Option<std::time::Instant>,
     closed: bool,
 }
 
@@ -229,7 +231,14 @@ impl Dispatch<XdgSurface, ()> for HostState {
 impl Dispatch<XdgToplevel, ()> for HostState {
     fn event(state: &mut Self, _: &XdgToplevel, event: xdg_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match event {
-            xdg_toplevel::Event::Configure { width, height, .. } => {
+            xdg_toplevel::Event::Configure { width, height, states } => {
+                let activated = states.chunks_exact(4).any(|chunk| {
+                    u32::from_ne_bytes(chunk.try_into().unwrap()) == wayland_protocols::xdg::shell::client::xdg_toplevel::State::Activated as u32
+                });
+                if state.is_focused != activated {
+                    println!("[nori-view] Focus transition: is_focused={activated}");
+                    state.is_focused = activated;
+                }
                 if width > 0 && height > 0 {
                     state.width = width as u32;
                     state.height = height as u32;
@@ -736,6 +745,8 @@ fn main() -> Result<()> {
         shift_held: false,
         buffer_busy: Vec::new(),
         is_fullscreen: false,
+        is_focused: true,
+        last_unfocused_capture: None,
         closed: false,
     };
 
@@ -912,8 +923,20 @@ fn main() -> Result<()> {
             target_conn.flush()?;
         }
 
-        // If no capture is currently inflight, pick an available buffer that is NOT in use by the host
-        if current_frame.is_none() {
+        // Determine whether to initiate a screencopy frame capture:
+        // - When focused: capture continuously at full speed (60 FPS)
+        // - When unfocused: throttle capture to standby rate (5 FPS = every 200ms) to let slot sleep
+        let now = std::time::Instant::now();
+        let should_capture = if host_state.is_focused {
+            true
+        } else {
+            match host_state.last_unfocused_capture {
+                Some(last) => now.duration_since(last) >= Duration::from_millis(200),
+                None => true,
+            }
+        };
+
+        if should_capture && current_frame.is_none() {
             let mut free_idx = None;
             for i in 0..buffers.len() {
                 let candidate = (next_buffer_idx + i) % buffers.len();
@@ -930,6 +953,9 @@ fn main() -> Result<()> {
                 frame.copy_with_damage(target_buf);
                 current_frame = Some(frame);
                 target_conn.flush()?;
+                if !host_state.is_focused {
+                    host_state.last_unfocused_capture = Some(now);
+                }
             }
         }
 
@@ -945,7 +971,8 @@ fn main() -> Result<()> {
                 nix::poll::PollFd::new(hg.connection_fd(), nix::poll::PollFlags::POLLIN),
                 nix::poll::PollFd::new(tg.connection_fd(), nix::poll::PollFlags::POLLIN),
             ];
-            let _ = nix::poll::poll(&mut poll_fds, nix::poll::PollTimeout::from(16u16));
+            let poll_timeout = if host_state.is_focused { 16u16 } else { 100u16 };
+            let _ = nix::poll::poll(&mut poll_fds, nix::poll::PollTimeout::from(poll_timeout));
             let host_revents = poll_fds[0].revents().unwrap_or(nix::poll::PollFlags::empty());
             let target_revents = poll_fds[1].revents().unwrap_or(nix::poll::PollFlags::empty());
             drop(poll_fds);
