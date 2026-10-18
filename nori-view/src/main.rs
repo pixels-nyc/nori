@@ -131,6 +131,7 @@ struct HostState {
     inhibitor_active: bool,
     mod_held: bool,
     shift_held: bool,
+    buffer_busy: Vec<bool>,
     is_fullscreen: bool,
     closed: bool,
 }
@@ -441,7 +442,13 @@ impl Dispatch<ZwpLinuxBufferParamsV1, usize> for HostState {
 }
 
 impl Dispatch<WlBuffer, usize> for HostState {
-    fn event(_: &mut Self, _: &WlBuffer, _: wayland_client::protocol::wl_buffer::Event, _: &usize, _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(state: &mut Self, _: &WlBuffer, event: wayland_client::protocol::wl_buffer::Event, id: &usize, _: &Connection, _: &QueueHandle<Self>) {
+        if let wayland_client::protocol::wl_buffer::Event::Release = event {
+            if *id < state.buffer_busy.len() {
+                state.buffer_busy[*id] = false;
+            }
+        }
+    }
 }
 
 impl Dispatch<ZwpKeyboardShortcutsInhibitManagerV1, ()> for HostState {
@@ -727,6 +734,7 @@ fn main() -> Result<()> {
         inhibitor_active: true,
         mod_held: false,
         shift_held: false,
+        buffer_busy: Vec::new(),
         is_fullscreen: false,
         closed: false,
     };
@@ -783,15 +791,17 @@ fn main() -> Result<()> {
         target_state.width, target_state.height
     );
 
-    // Allocate 3 Zero-Copy DMA-BUF Buffers (Triple Buffering)
+    // Allocate 4 Zero-Copy DMA-BUF Buffers (Quad Buffering with Host Release Tracking)
     let buffer_width = target_state.width;
     let buffer_height = target_state.height;
     let target_dmabuf = target_state.linux_dmabuf.as_ref().context("target lacks zwp_linux_dmabuf_v1")?;
     let host_dmabuf = host_state.linux_dmabuf.as_ref().context("host lacks zwp_linux_dmabuf_v1")?;
 
     let mut buffers: Vec<DmaBuffer> = Vec::new();
+    const NUM_BUFFERS: usize = 4;
+    host_state.buffer_busy = vec![false; NUM_BUFFERS];
 
-    for id in 0..3 {
+    for id in 0..NUM_BUFFERS {
         let bo = gbm_dev
             .create_buffer_object::<()>(
                 buffer_width,
@@ -876,6 +886,7 @@ fn main() -> Result<()> {
                         vp.button(time, button, state);
                     }
                     PointerEvent::Axis { time, axis, value } => {
+                        vp.axis_source(wayland_client::protocol::wl_pointer::AxisSource::Wheel);
                         vp.axis(time, axis, value);
                     }
                     PointerEvent::Frame => {
@@ -901,16 +912,25 @@ fn main() -> Result<()> {
             target_conn.flush()?;
         }
 
-        // If no capture is currently inflight, request a new frame using the next available DMA-BUF
+        // If no capture is currently inflight, pick an available buffer that is NOT in use by the host
         if current_frame.is_none() {
-            let buf_idx = next_buffer_idx;
-            next_buffer_idx = (next_buffer_idx + 1) % buffers.len();
+            let mut free_idx = None;
+            for i in 0..buffers.len() {
+                let candidate = (next_buffer_idx + i) % buffers.len();
+                if !host_state.buffer_busy[candidate] {
+                    free_idx = Some(candidate);
+                    break;
+                }
+            }
 
-            let target_buf = &buffers[buf_idx].target_buffer;
-            let frame = screencopy_mgr.capture_output(0, &target_output, &target_qh, buf_idx);
-            frame.copy_with_damage(target_buf);
-            current_frame = Some(frame);
-            target_conn.flush()?;
+            if let Some(buf_idx) = free_idx {
+                next_buffer_idx = (buf_idx + 1) % buffers.len();
+                let target_buf = &buffers[buf_idx].target_buffer;
+                let frame = screencopy_mgr.capture_output(0, &target_output, &target_qh, buf_idx);
+                frame.copy_with_damage(target_buf);
+                current_frame = Some(frame);
+                target_conn.flush()?;
+            }
         }
 
         // Flush pending requests to both compositors
@@ -953,6 +973,7 @@ fn main() -> Result<()> {
                 }
                 host_surface.damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
                 host_surface.commit();
+                host_state.buffer_busy[buf_idx] = true;
                 host_conn.flush()?;
             }
         } else if target_state.frame_failed {
