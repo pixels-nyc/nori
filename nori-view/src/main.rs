@@ -23,7 +23,7 @@ use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
     zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
-    zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
+    zwp_keyboard_shortcuts_inhibitor_v1::{self, ZwpKeyboardShortcutsInhibitorV1},
 };
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
@@ -121,6 +121,7 @@ struct HostState {
     height: u32,
 
     pointer_events: Vec<PointerEvent>,
+    keyboard_events: Vec<KeyboardEvent>,
     inhibitor_active: bool,
     mod_held: bool,
     shift_held: bool,
@@ -134,6 +135,12 @@ enum PointerEvent {
     Button { time: u32, button: u32, state: ButtonState },
     Axis { time: u32, axis: wl_pointer::Axis, value: f64 },
     Frame,
+}
+
+#[derive(Clone, Debug)]
+enum KeyboardEvent {
+    Key { time: u32, key: u32, state: u32 },
+    Modifiers { depressed: u32, latched: u32, locked: u32, group: u32 },
 }
 
 impl Dispatch<WlRegistry, ()> for HostState {
@@ -273,11 +280,12 @@ impl Dispatch<WlPointer, ()> for HostState {
 }
 
 impl Dispatch<WlKeyboard, ()> for HostState {
-    fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+    fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, _qh: &QueueHandle<Self>) {
         match event {
-            wl_keyboard::Event::Key { key, state: kstate, .. } => {
+            wl_keyboard::Event::Key { time, key, state: kstate, .. } => {
                 if let WEnum::Value(kstate) = kstate {
                     let is_pressed = kstate == KeyState::Pressed;
+                    let state_val = if is_pressed { 1 } else { 0 };
 
                     // Direct keycode tracking for Super (125/126) and Shift (42/54)
                     if key == 125 || key == 126 {
@@ -304,28 +312,23 @@ impl Dispatch<WlKeyboard, ()> for HostState {
                         return;
                     }
 
-                    // Key 1 is KEY_ESC: Mod+Esc escape chord: toggle shortcuts inhibitor
-                    if key == 1 && state.mod_held && is_pressed {
-                        state.inhibitor_active = !state.inhibitor_active;
-                        if let Some(inhibitor) = &state.inhibitor {
-                            if !state.inhibitor_active {
-                                inhibitor.destroy();
-                                state.inhibitor = None;
-                                println!("[nori-view] Focus Escape: Host navigation unlocked (shortcuts enabled)");
-                            }
-                        } else if state.inhibitor_active {
-                            if let (Some(inhibit_mgr), Some(seat), Some(surface)) = (&state.inhibit_manager, &state.seat, &state.surface) {
-                                state.inhibitor = Some(inhibit_mgr.inhibit_shortcuts(surface, seat, qh, ()));
-                                println!("[nori-view] Focus Lock: Shortcuts inhibited for slot");
-                            }
-                        }
-                        return;
-                    }
+                    // Forward all other keys to target virtual keyboard
+                    state.keyboard_events.push(KeyboardEvent::Key {
+                        time,
+                        key,
+                        state: state_val,
+                    });
                 }
             }
-            wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
+            wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
                 state.shift_held = (mods_depressed & 0x01) != 0;
                 state.mod_held = (mods_depressed & 0x40) != 0 || (mods_depressed & 0x08) != 0;
+                state.keyboard_events.push(KeyboardEvent::Modifiers {
+                    depressed: mods_depressed,
+                    latched: mods_latched,
+                    locked: mods_locked,
+                    group,
+                });
             }
             _ => {}
         }
@@ -378,7 +381,19 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitManagerV1, ()> for HostState {
 }
 
 impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for HostState {
-    fn event(_: &mut Self, _: &ZwpKeyboardShortcutsInhibitorV1, _: wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(state: &mut Self, _: &ZwpKeyboardShortcutsInhibitorV1, event: zwp_keyboard_shortcuts_inhibitor_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => {
+                state.inhibitor_active = true;
+                println!("[nori-view] Shortcuts inhibitor: ACTIVE (captive to slot)");
+            }
+            zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => {
+                state.inhibitor_active = false;
+                println!("[nori-view] Shortcuts inhibitor: INACTIVE (released to host)");
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Dispatch<WpViewporter, ()> for HostState {
@@ -394,6 +409,7 @@ impl Dispatch<WpViewport, ()> for HostState {
 // ---------------------------------------------------------------------------
 
 struct TargetState {
+    seat: Option<WlSeat>,
     output: Option<WlOutput>,
     output_name: String,
     screencopy_manager: Option<ZwlrScreencopyManagerV1>,
@@ -422,6 +438,10 @@ impl Dispatch<WlRegistry, ()> for TargetState {
     ) {
         if let wl_registry::Event::Global { name, interface, version } = event {
             match interface.as_str() {
+                "wl_seat" => {
+                    let seat = registry.bind(name, version.min(7), qh, ());
+                    state.seat = Some(seat);
+                }
                 "wl_output" => {
                     let out = registry.bind(name, version.min(4), qh, ());
                     if state.output.is_none() {
@@ -520,6 +540,10 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for TargetState {
     fn event(_: &mut Self, _: &ZwpVirtualKeyboardV1, _: wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
+impl Dispatch<WlSeat, ()> for TargetState {
+    fn event(_: &mut Self, _: &WlSeat, _: wl_seat::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -575,6 +599,7 @@ fn main() -> Result<()> {
     let target_qh = target_queue.handle();
 
     let mut target_state = TargetState {
+        seat: None,
         output: None,
         output_name: args.output.clone(),
         screencopy_manager: None,
@@ -594,6 +619,13 @@ fn main() -> Result<()> {
     let _target_registry = target_conn.display().get_registry(&target_qh, ());
     target_queue.roundtrip(&mut target_state)?;
     target_queue.roundtrip(&mut target_state)?;
+
+    if target_state.virtual_keyboard.is_none() {
+        if let (Some(mgr), Some(seat)) = (&target_state.virtual_keyboard_mgr, &target_state.seat) {
+            target_state.virtual_keyboard = Some(mgr.create_virtual_keyboard(seat, &target_qh, ()));
+            println!("[nori-view] Successfully initialized Target Virtual Keyboard for slot input");
+        }
+    }
 
     // Connect to Host
     let host_stream = UnixStream::connect(&host_socket_path)
@@ -621,6 +653,7 @@ fn main() -> Result<()> {
         width: (target_state.width as f64 / 1.5).round() as u32,
         height: (target_state.height as f64 / 1.5).round() as u32,
         pointer_events: Vec::new(),
+        keyboard_events: Vec::new(),
         inhibitor_active: true,
         mod_held: false,
         shift_held: false,
@@ -749,6 +782,7 @@ fn main() -> Result<()> {
     let screencopy_mgr = target_state.screencopy_manager.clone().context("target lacks zwlr_screencopy_manager_v1")?;
     let target_output = target_state.output.clone().context("target lacks output")?;
     let virtual_pointer = target_state.virtual_pointer.clone();
+    let virtual_keyboard = target_state.virtual_keyboard.clone();
 
     let mut current_frame: Option<ZwlrScreencopyFrameV1> = None;
     let mut next_buffer_idx = 0;
@@ -758,7 +792,7 @@ fn main() -> Result<()> {
         // Dispatch host events (user input, window resizes)
         host_queue.dispatch_pending(&mut host_state)?;
 
-        // Forward input events from host to target
+        // Forward pointer events from host to target
         if let Some(vp) = &virtual_pointer {
             for event in host_state.pointer_events.drain(..) {
                 match event {
@@ -775,6 +809,21 @@ fn main() -> Result<()> {
                     }
                     PointerEvent::Frame => {
                         vp.frame();
+                    }
+                }
+            }
+            target_conn.flush()?;
+        }
+
+        // Forward keyboard events from host to target
+        if let Some(vk) = &virtual_keyboard {
+            for event in host_state.keyboard_events.drain(..) {
+                match event {
+                    KeyboardEvent::Key { time, key, state } => {
+                        vk.key(time, key, state);
+                    }
+                    KeyboardEvent::Modifiers { depressed, latched, locked, group } => {
+                        vk.modifiers(depressed, latched, locked, group);
                     }
                 }
             }
