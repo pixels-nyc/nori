@@ -404,65 +404,33 @@ impl State {
     }
 
     fn is_inhibiting_shortcuts(&self) -> bool {
+        let Some(surface) = self.niri.keyboard_focus.surface() else {
+            return false;
+        };
+
+        if self.niri.manual_shortcuts_inhibited_surfaces.contains(surface) {
+            return true;
+        }
+
         self.niri
-            .keyboard_focus
-            .surface()
-            .and_then(|surface| {
-                self.niri
-                    .keyboard_shortcuts_inhibiting_surfaces
-                    .get(surface)
-            })
+            .keyboard_shortcuts_inhibiting_surfaces
+            .get(surface)
             .is_some_and(KeyboardShortcutsInhibitor::is_active)
     }
 
     fn is_inhibiting_gestures(&self) -> bool {
-        if self.is_inhibiting_shortcuts() {
-            return true;
-        }
-
-        if let Some(surface) = self.niri.keyboard_focus.surface() {
-            let root = self.niri.find_root_shell_surface(surface);
-            if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&root) {
-                let (app_id, title) = crate::utils::with_toplevel_role(mapped.toplevel(), |role| {
-                    (role.app_id.clone(), role.title.clone())
-                });
-                if let Some(app_id) = app_id {
-                    if app_id.starts_with("nori-viewer") || app_id.starts_with("wlvncc") {
-                        return true;
-                    }
-                }
-                if title.as_deref().unwrap_or("").contains("nori-viewer") {
-                    return true;
-                }
-            }
-        }
-        false
+        self.is_inhibiting_shortcuts()
     }
 
     fn is_surface_inhibiting_gestures(&self, surface: &WlSurface) -> bool {
-        if self
-            .niri
+        if self.niri.manual_shortcuts_inhibited_surfaces.contains(surface) {
+            return true;
+        }
+
+        self.niri
             .keyboard_shortcuts_inhibiting_surfaces
             .get(surface)
             .is_some_and(KeyboardShortcutsInhibitor::is_active)
-        {
-            return true;
-        }
-        let root = self.niri.find_root_shell_surface(surface);
-        if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&root) {
-            let (app_id, title) = crate::utils::with_toplevel_role(mapped.toplevel(), |role| {
-                (role.app_id.clone(), role.title.clone())
-            });
-            if let Some(app_id) = app_id {
-                if app_id.starts_with("nori-viewer") || app_id.starts_with("wlvncc") {
-                    return true;
-                }
-            }
-            if title.as_deref().unwrap_or("").contains("nori-viewer") {
-                return true;
-            }
-        }
-        false
     }
 
     fn focused_slot_info(&self) -> Option<slot_passthrough::TargetSlotInfo> {
@@ -907,16 +875,43 @@ impl State {
                 }
             }
             Action::ToggleKeyboardShortcutsInhibit => {
-                if let Some(inhibitor) = self.niri.keyboard_focus.surface().and_then(|surface| {
-                    self.niri
-                        .keyboard_shortcuts_inhibiting_surfaces
-                        .get(surface)
-                }) {
-                    if inhibitor.is_active() {
-                        inhibitor.inactivate();
-                    } else {
-                        inhibitor.activate();
+                let surface = self.niri.keyboard_focus.surface().cloned();
+                if let Some(surface) = surface {
+                    let mut is_active = false;
+                    let mut toggled = false;
+
+                    if let Some(inhibitor) = self.niri.keyboard_shortcuts_inhibiting_surfaces.get(&surface) {
+                        if inhibitor.is_active() {
+                            inhibitor.inactivate();
+                            is_active = false;
+                        } else {
+                            inhibitor.activate();
+                            is_active = true;
+                        }
+                        toggled = true;
                     }
+
+                    if !toggled {
+                        if self.niri.manual_shortcuts_inhibited_surfaces.contains(&surface) {
+                            self.niri.manual_shortcuts_inhibited_surfaces.remove(&surface);
+                            is_active = false;
+                        } else {
+                            self.niri.manual_shortcuts_inhibited_surfaces.insert(surface.clone());
+                            is_active = true;
+                        }
+                    }
+
+                    let state_str = if is_active {
+                        "LOCKED (Keys & Gestures captured by Session)"
+                    } else {
+                        "UNLOCKED (Keys & Gestures routed to Host)"
+                    };
+                    spawn_sh(
+                        format!(
+                            "notify-send -a 'PiX OS Z-Axis' -i security-high -t 1500 'Session Lock' '{state_str}'"
+                        ),
+                        None,
+                    );
                 }
             }
             Action::CloseWindow => {

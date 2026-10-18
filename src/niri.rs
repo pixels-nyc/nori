@@ -357,6 +357,7 @@ pub struct Niri {
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
     pub is_fdo_idle_inhibited: Arc<AtomicBool>,
     pub keyboard_shortcuts_inhibiting_surfaces: HashMap<WlSurface, KeyboardShortcutsInhibitor>,
+    pub manual_shortcuts_inhibited_surfaces: HashSet<WlSurface>,
 
     /// Most recent XKB settings from org.freedesktop.locale1.
     pub xkb_from_locale1: Option<Xkb>,
@@ -2780,6 +2781,7 @@ impl Niri {
             idle_inhibiting_surfaces: HashSet::new(),
             is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
             keyboard_shortcuts_inhibiting_surfaces: HashMap::new(),
+            manual_shortcuts_inhibited_surfaces: HashSet::new(),
             xkb_from_locale1: None,
             cursor_manager,
             cursor_texture_cache: Default::default(),
