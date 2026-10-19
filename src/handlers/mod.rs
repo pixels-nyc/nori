@@ -642,7 +642,13 @@ impl ScreencopyHandler for State {
         // If with_damage then push it onto the queue for redraw of the output,
         // otherwise render it immediately.
         if screencopy.with_damage() {
+            let output = screencopy.output().clone();
             self.niri.screencopy_state.push(manager, screencopy);
+            // Wake the output so the queued capture renders promptly instead
+            // of waiting for the next client-driven or timer-driven redraw.
+            // This matters most for headless slots, whose frame clock idles
+            // at standby rate when no viewer is attached yet.
+            self.niri.queue_redraw(&output);
         } else {
             self.backend.with_primary_renderer(|renderer| {
                 if let Err(err) = self
