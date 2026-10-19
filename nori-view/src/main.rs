@@ -1,19 +1,30 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use gbm::{BufferObject, BufferObjectFlags, Device, Format, Modifier};
 
+mod cursor;
+
+use wayland_client::event_created_child;
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
     wl_callback::WlCallback,
     wl_compositor::WlCompositor,
+    wl_data_device::{self, WlDataDevice},
+    wl_data_device_manager::{DndAction, WlDataDeviceManager},
+    wl_data_offer::{self, WlDataOffer},
+    wl_data_source::{self, WlDataSource},
     wl_keyboard::{self, KeyState, WlKeyboard},
+    wl_shm::{self, WlShm},
+    wl_shm_pool::WlShmPool,
     wl_output::{self, WlOutput},
     wl_pointer::{self, ButtonState, WlPointer},
     wl_registry::{self, WlRegistry},
@@ -92,6 +103,18 @@ struct Args {
     /// DRM render node path
     #[arg(long, default_value = "/dev/dri/renderD128")]
     drm_node: PathBuf,
+
+    /// Head number shown as the cursor numeral (defaults to --slot)
+    #[arg(long)]
+    head_num: Option<u32>,
+
+    /// Node name selecting the cursor accent color (defaults to "local")
+    #[arg(long)]
+    node: Option<String>,
+
+    /// Cursor accent override: palette name or #rrggbb (defaults by node)
+    #[arg(long)]
+    accent: Option<String>,
 }
 
 struct DmaBuffer {
@@ -130,6 +153,8 @@ struct HostState {
 
     pointer_events: Vec<PointerEvent>,
     keyboard_events: Vec<KeyboardEvent>,
+    pending_axis_source: wl_pointer::AxisSource,
+    last_axis_value: [f64; 2],
     held_keys: HashSet<u32>,
     inhibitor_active: bool,
     mod_held: bool,
@@ -140,9 +165,143 @@ struct HostState {
     is_focused: bool,
     last_unfocused_capture: Option<std::time::Instant>,
     closed: bool,
+    dnd: DndBridge,
 }
 
 impl HostState {
+    /// Turn a slot drag that left the viewer surface into a host-side drag.
+    ///
+    /// Called every frame while `escape_wanted` (set on pointer Leave). Waits
+    /// for cached payload data, then starts the host drag with the remembered
+    /// press serial and cancels the slot drag so the gesture lands once.
+    fn dnd_maybe_escape(&mut self, qh: &QueueHandle<Self>) {
+        if !self.dnd.escape_wanted {
+            return;
+        }
+        let Some(drag) = &self.dnd.drag else {
+            self.dnd.escape_wanted = false;
+            return;
+        };
+        if drag.escaped || self.dnd.pointer_inside || !self.dnd.button_held {
+            // Re-entered, released, or already escaped: nothing to do. A fresh
+            // Leave re-arms if the drag is still alive.
+            self.dnd.escape_wanted = false;
+            return;
+        }
+        if drag.cache.is_empty() {
+            // Payloads still in flight; retry over the next frames.
+            return;
+        }
+        let (Some(serial), Some(dd), Some(mgr), Some(surface)) = (
+            self.dnd.last_press_serial,
+            self.dnd.dd.clone(),
+            self.dnd.dd_manager.clone(),
+            self.surface.clone(),
+        ) else {
+            println!("[nori-view] DnD escape impossible (no serial/device/surface)");
+            self.dnd.escape_wanted = false;
+            return;
+        };
+        let mimes: Vec<String> = self
+            .dnd
+            .drag
+            .as_ref()
+            .map(|drag| drag.cache.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let source = mgr.create_data_source(qh, ());
+        for mime in &mimes {
+            source.offer(mime.clone());
+        }
+        // copy|move; v1 always copies (the slot source sees cancel).
+        source.set_actions(DndAction::Copy | DndAction::Move);
+        let icon = self.dnd_create_icon(qh);
+        dd.start_drag(
+            Some(&source),
+            &surface,
+            icon.as_ref().map(|icon| &icon.surface),
+            serial,
+        );
+        println!("[nori-view] DnD escaped to host with mimes {mimes:?}");
+
+        self.dnd.icon = icon;
+        self.dnd.source = Some(source);
+        self.dnd.host_drag_active = true;
+        self.dnd.escape_wanted = false;
+        if let Some(drag) = self.dnd.drag.as_mut() {
+            drag.escaped = true;
+        }
+        self.dnd
+            .send_cmd(&serde_json::json!({"cmd": "cancel_drag"}).to_string());
+    }
+
+    /// File classes from the cached URI-list payload, if any.
+    fn drag_files(&self) -> (Vec<cursor::FileClass>, usize) {
+        self.dnd
+            .drag
+            .as_ref()
+            .and_then(|drag| drag.cache.get("text/uri-list"))
+            .and_then(|uris| std::str::from_utf8(uris).ok())
+            .map(cursor::classify_uris)
+            .unwrap_or_default()
+    }
+
+    /// Spec for the viewer cursor right now: idle badged arrow, or drag/file
+    /// composition while a live unescaped drag sits under a held button.
+    fn cursor_spec(&self) -> cursor::CursorSpec {
+        let mut spec = cursor::CursorSpec::idle(self.dnd.head_num, self.dnd.accent);
+        let active = self.dnd.pointer_inside
+            && self.dnd.button_held
+            && self.dnd.drag.as_ref().is_some_and(|d| !d.escaped);
+        if !active {
+            return spec;
+        }
+        let (files, count) = self.drag_files();
+        if count > 0 {
+            spec.files = files;
+            spec.file_count = count;
+        }
+        spec.drag = Some(cursor::DragBadge::Neutral);
+        spec
+    }
+
+    /// Spec for the escape icon: file glyphs from the cache plus the live
+    /// host acceptance state.
+    fn icon_spec(&self, accepted: bool) -> cursor::CursorSpec {
+        let mut spec = cursor::CursorSpec::idle(self.dnd.head_num, self.dnd.accent);
+        let (files, count) = self.drag_files();
+        spec.files = files;
+        spec.file_count = count;
+        spec.drag = Some(if accepted {
+            cursor::DragBadge::Accepted
+        } else {
+            cursor::DragBadge::Neutral
+        });
+        spec
+    }
+
+    /// Redraw the viewer cursor when its spec changed (cheap no-op otherwise).
+    fn sync_cursor(&mut self) {
+        let spec = self.cursor_spec();
+        if let Some(cursor) = self.dnd.cursor.as_mut() {
+            cursor.redraw(spec);
+        }
+    }
+
+    /// Build the host drag icon from the current drag cache. None without shm
+    /// (drag works, just without an icon).
+    fn dnd_create_icon(&mut self, qh: &QueueHandle<Self>) -> Option<CursorSurface> {
+        let (shm, compositor) = (self.dnd.shm.clone()?, self.compositor.clone()?);
+        let spec = self.icon_spec(false);
+        CursorSurface::create(&compositor, &shm, qh, "icon", spec)
+    }
+
+    fn dnd_destroy_icon(&mut self) {
+        if let Some(icon) = self.dnd.icon.take() {
+            icon.destroy();
+        }
+    }
+
     fn release_all_held_keys(&mut self) {
         if !self.held_keys.is_empty() {
             println!("[nori-view] Releasing all {} held keys on slot", self.held_keys.len());
@@ -163,7 +322,18 @@ impl HostState {
 enum PointerEvent {
     MotionAbsolute { time: u32, x: f64, y: f64 },
     Button { time: u32, button: u32, state: ButtonState },
-    Axis { time: u32, axis: wl_pointer::Axis, value: f64 },
+    Axis {
+        time: u32,
+        axis: wl_pointer::Axis,
+        value: f64,
+        source: wl_pointer::AxisSource,
+    },
+    AxisDiscrete {
+        axis: wl_pointer::Axis,
+        value: f64,
+        discrete: i32,
+    },
+    AxisStop { time: u32, axis: wl_pointer::Axis },
     Frame,
 }
 
@@ -171,6 +341,442 @@ enum PointerEvent {
 enum KeyboardEvent {
     Key { time: u32, key: u32, state: u32 },
     Modifiers { depressed: u32, latched: u32, locked: u32, group: u32 },
+}
+
+// ---------------------------------------------------------------------------
+// DnD bridge: slot drags escape to the host exactly once.
+//
+// The slot notifies us of drags over `nori-dnd-{slot}.sock` and serves eagerly
+// copied payloads there. While the pointer stays inside the viewer the slot
+// drag proceeds internally and we do nothing. When the host pointer leaves the
+// viewer surface mid-drag, we start a host-side drag (reusing the remembered
+// button-press serial), serve its data from our cache, and tell the slot to
+// cancel its drag -- so the gesture completes exactly once, on the host.
+// ---------------------------------------------------------------------------
+
+const BTN_LEFT: u32 = 0x110;
+
+#[derive(Debug, PartialEq)]
+enum DndSockEvent {
+    Watching {
+        gen: u64,
+    },
+    DragStarted {
+        gen: u64,
+        mimes: Vec<String>,
+    },
+    DragEnded {
+        gen: u64,
+    },
+    DataReady {
+        gen: u64,
+        mime: String,
+        ok: bool,
+    },
+    Data {
+        id: u64,
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    NoData {
+        id: u64,
+        pending: bool,
+    },
+    DragCancelled {
+        ok: bool,
+    },
+    ExternalStarted {
+        ok: bool,
+    },
+    NeedData {
+        mime: String,
+    },
+    Pong,
+}
+
+fn json_str(v: &serde_json::Value, key: &str) -> String {
+    v.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+}
+
+fn json_u64(v: &serde_json::Value, key: &str) -> u64 {
+    v.get(key).and_then(|v| v.as_u64()).unwrap_or_default()
+}
+
+/// Incremental parser for the slot socket's line + raw-byte framing.
+#[derive(Default)]
+struct DndSockParser {
+    buf: Vec<u8>,
+    pending_data: Option<(u64, String, usize)>,
+}
+
+impl DndSockParser {
+    fn push(&mut self, chunk: &[u8]) -> Vec<DndSockEvent> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        loop {
+            if let Some((id, mime, len)) = self.pending_data.take() {
+                if self.buf.len() < len {
+                    self.pending_data = Some((id, mime, len));
+                    break;
+                }
+                let bytes = self.buf.drain(..len).collect::<Vec<u8>>();
+                out.push(DndSockEvent::Data { id, mime, bytes });
+                continue;
+            }
+            let Some(nl) = self.buf.iter().position(|b| *b == b'\n') else {
+                break;
+            };
+            let line = self.buf.drain(..=nl).collect::<Vec<u8>>();
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            match v.get("event").and_then(|e| e.as_str()).unwrap_or_default() {
+                "watching" => out.push(DndSockEvent::Watching {
+                    gen: json_u64(&v, "gen"),
+                }),
+                "drag_started" => {
+                    let mimes = v
+                        .get("mimes")
+                        .and_then(|m| m.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|m| m.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    out.push(DndSockEvent::DragStarted {
+                        gen: json_u64(&v, "gen"),
+                        mimes,
+                    });
+                }
+                "drag_ended" => out.push(DndSockEvent::DragEnded {
+                    gen: json_u64(&v, "gen"),
+                }),
+                "data_ready" => out.push(DndSockEvent::DataReady {
+                    gen: json_u64(&v, "gen"),
+                    mime: json_str(&v, "mime"),
+                    ok: v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false),
+                }),
+                "data" => {
+                    self.pending_data = Some((
+                        json_u64(&v, "id"),
+                        json_str(&v, "mime"),
+                        v.get("len").and_then(|l| l.as_u64()).unwrap_or_default() as usize,
+                    ));
+                }
+                "nodata" => out.push(DndSockEvent::NoData {
+                    id: json_u64(&v, "id"),
+                    pending: v.get("pending").and_then(|p| p.as_bool()).unwrap_or(false),
+                }),
+                "drag_cancelled" => out.push(DndSockEvent::DragCancelled {
+                    ok: v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false),
+                }),
+                "external_started" => out.push(DndSockEvent::ExternalStarted {
+                    ok: v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false),
+                }),
+                "need_data" => out.push(DndSockEvent::NeedData {
+                    mime: json_str(&v, "mime"),
+                }),
+                "pong" => out.push(DndSockEvent::Pong),
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+#[derive(Default)]
+struct SlotDrag {
+    gen: u64,
+    cache: HashMap<String, Vec<u8>>,
+    awaiting: HashSet<String>,
+    escaped: bool,
+}
+
+#[derive(Default)]
+struct DndBridge {
+    sock: Option<UnixStream>,
+    /// Locked writer clone: host-receive threads push slot-bound data here.
+    writer: Option<Arc<Mutex<UnixStream>>>,
+    /// Host payloads by MIME (`None` = receive failed), shared with threads.
+    host_cache: Option<Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>>,
+    parser: DndSockParser,
+    next_id: u64,
+    outstanding: HashMap<u64, String>,
+    drag: Option<SlotDrag>,
+    escape_wanted: bool,
+    pointer_inside: bool,
+    button_held: bool,
+    last_press_serial: Option<u32>,
+    dd_manager: Option<WlDataDeviceManager>,
+    dd: Option<WlDataDevice>,
+    shm: Option<WlShm>,
+    last_enter_serial: Option<u32>,
+    head_num: u32,
+    accent: [u8; 4],
+    cursor: Option<CursorSurface>,
+    source: Option<WlDataSource>,
+    icon: Option<CursorSurface>,
+    incoming_offer: Option<WlDataOffer>,
+    incoming_mimes: Vec<String>,
+    host_drag_active: bool,
+    external_injected: bool,
+}
+
+/// Write through a non-blocking socket, waiting for POLLOUT when full.
+fn write_all_nonblocking(sock: &UnixStream, mut buf: &[u8]) {
+    let mut s = sock;
+    while !buf.is_empty() {
+        match s.write(buf) {
+            Ok(0) => break,
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut pfd =
+                    [nix::poll::PollFd::new(sock.as_fd(), nix::poll::PollFlags::POLLOUT)];
+                let _ = nix::poll::poll(&mut pfd, nix::poll::PollTimeout::from(100u16));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+impl DndBridge {
+    /// Main-thread commands go over the reader connection, because replies
+    /// (watching/data/nodata/external_started) arrive on the same connection
+    /// the request used -- and only the reader is pumped.
+    fn send_cmd(&self, body: &str) {
+        if let Some(sock) = &self.sock {
+            let mut line = body.to_string();
+            line.push('\n');
+            write_all_nonblocking(sock, line.as_bytes());
+        }
+    }
+
+    /// Push one host payload to the slot (header line + raw bytes).
+    fn send_data_push(&self, mime: &str, bytes: &[u8]) {
+        if let Some(sock) = &self.sock {
+            let header =
+                serde_json::json!({"cmd": "external_drag_data", "mime": mime, "len": bytes.len()})
+                    .to_string()
+                + "\n";
+            write_all_nonblocking(sock, header.as_bytes());
+            write_all_nonblocking(sock, bytes);
+        }
+    }
+
+    fn request_data(&mut self, mime: &str) {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.outstanding.insert(id, mime.to_string());
+        let cmd = serde_json::json!({"cmd": "get_data", "id": id, "mime": mime}).to_string();
+        self.send_cmd(&cmd);
+    }
+
+    /// Drain the slot socket (non-blocking) and handle framing/events.
+    fn pump(&mut self) {
+        let mut dead = false;
+        let mut events = Vec::new();
+        if self.sock.is_some() {
+            let mut tmp = [0u8; 65536];
+            loop {
+                let read_result = self.sock.as_ref().unwrap().read(&mut tmp);
+                match read_result {
+                    Ok(0) => {
+                        dead = true;
+                        break;
+                    }
+                    Ok(n) => events.extend(self.parser.push(&tmp[..n])),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if dead {
+            println!("[nori-view] DnD socket closed; bridge disabled");
+            self.sock = None;
+            self.drag = None;
+        }
+        for event in events {
+            self.handle_sock_event(event);
+        }
+    }
+
+    fn handle_sock_event(&mut self, event: DndSockEvent) {
+        match event {
+            DndSockEvent::Watching { gen } => {
+                println!("[nori-view] DnD watching slot (gen {gen})");
+            }
+            DndSockEvent::DragStarted { gen, mimes } => {
+                println!("[nori-view] DnD slot drag started: gen={gen} mimes={mimes:?}");
+                let mut drag = SlotDrag {
+                    gen,
+                    ..SlotDrag::default()
+                };
+                for mime in &mimes {
+                    drag.awaiting.insert(mime.clone());
+                    self.request_data(mime);
+                }
+                self.drag = Some(drag);
+                self.escape_wanted = false;
+            }
+            DndSockEvent::DataReady { gen, mime, ok } => {
+                let wanted = self
+                    .drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.gen == gen && drag.awaiting.contains(&mime));
+                if wanted {
+                    if ok {
+                        self.request_data(&mime);
+                    } else if let Some(drag) = self.drag.as_mut() {
+                        drag.awaiting.remove(&mime);
+                    }
+                }
+            }
+            DndSockEvent::Data { id, mime, bytes } => {
+                self.outstanding.remove(&id);
+                if let Some(drag) = self.drag.as_mut() {
+                    if drag.awaiting.remove(&mime) {
+                        println!(
+                            "[nori-view] DnD cached {mime}: {} bytes",
+                            bytes.len()
+                        );
+                        drag.cache.insert(mime, bytes);
+                    }
+                }
+            }
+            DndSockEvent::NoData { id, pending } => {
+                if let Some(mime) = self.outstanding.remove(&id) {
+                    if !pending {
+                        if let Some(drag) = self.drag.as_mut() {
+                            drag.awaiting.remove(&mime);
+                        }
+                    }
+                }
+            }
+            DndSockEvent::DragEnded { gen } => {
+                if self.drag.as_ref().is_some_and(|drag| drag.gen == gen) {
+                    println!("[nori-view] DnD slot drag ended (gen {gen})");
+                    self.drag = None;
+                }
+                self.escape_wanted = false;
+            }
+            DndSockEvent::DragCancelled { ok } => {
+                println!("[nori-view] DnD slot cancel confirmed: ok={ok}");
+            }
+            DndSockEvent::ExternalStarted { ok } => {
+                println!("[nori-view] DnD slot injection confirmed: ok={ok}");
+                self.external_injected = ok;
+            }
+            DndSockEvent::NeedData { mime } => {
+                // The slot asks (again) for a payload. Serve from the host
+                // cache when present; the receive threads push on arrival
+                // otherwise, and the slot queues the send meanwhile.
+                let cached = self
+                    .host_cache
+                    .as_ref()
+                    .and_then(|cache| cache.lock().ok())
+                    .and_then(|cache| cache.get(&mime).cloned());
+                match cached {
+                    Some(Some(bytes)) => self.send_data_push(&mime, &bytes),
+                    Some(None) => self.send_cmd(
+                        &serde_json::json!({"cmd": "external_drag_failed", "mime": mime})
+                            .to_string(),
+                    ),
+                    None => {}
+                }
+            }
+            DndSockEvent::Pong => {}
+        }
+    }
+}
+
+fn parse_slot_from_display(display: &str) -> Option<u32> {
+    display.rsplit('/').next()?.rsplit('-').next()?.parse().ok()
+}
+
+
+/// One shm-backed cursor surface and its pixels. Used both for the viewer
+/// cursor (badged per head) and the drag icon (file glyphs + accept state).
+struct CursorSurface {
+    surface: WlSurface,
+    buffer: WlBuffer,
+    pool: WlShmPool,
+    file: File,
+    spec: cursor::CursorSpec,
+}
+
+impl CursorSurface {
+    fn create(
+        compositor: &WlCompositor,
+        shm: &WlShm,
+        qh: &QueueHandle<HostState>,
+        tag: &str,
+        spec: cursor::CursorSpec,
+    ) -> Option<Self> {
+        let run = std::env::var("XDG_RUNTIME_DIR").ok()?;
+        let path = format!("{run}/nori-cursor-{tag}-{}.bin", std::process::id());
+        let pixels = cursor::compose_cursor(&spec);
+        // NOTE: read+write is mandatory. The compositor mmaps this fd
+        // PROT_READ|PROT_WRITE; a write-only fd fails mapping and the
+        // compositor kills us with a wl_shm protocol error.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .ok()?;
+        file.write_all(&pixels).ok()?;
+        let _ = std::fs::remove_file(&path);
+        let pool = shm.create_pool(file.as_fd(), pixels.len() as i32, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            cursor::ICON_SIZE,
+            cursor::ICON_SIZE,
+            cursor::ICON_STRIDE,
+            wl_shm::Format::Argb8888,
+            qh,
+            usize::MAX,
+        );
+        let surface = compositor.create_surface(qh, ());
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, cursor::ICON_SIZE, cursor::ICON_SIZE);
+        surface.commit();
+        Some(Self {
+            surface,
+            buffer,
+            pool,
+            file,
+            spec,
+        })
+    }
+
+    /// Redraw only when the spec changed.
+    fn redraw(&mut self, spec: cursor::CursorSpec) {
+        if self.spec == spec {
+            return;
+        }
+        self.spec = spec;
+        use std::io::Seek;
+        let pixels = cursor::compose_cursor(&self.spec);
+        if self.file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+            let _ = self.file.write_all(&pixels);
+        }
+        self.surface.damage_buffer(0, 0, cursor::ICON_SIZE, cursor::ICON_SIZE);
+        self.surface.commit();
+    }
+
+    fn destroy(self) {
+        self.surface.destroy();
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
 }
 
 impl Dispatch<WlRegistry, ()> for HostState {
@@ -201,6 +807,12 @@ impl Dispatch<WlRegistry, ()> for HostState {
                 }
                 "wp_viewporter" => {
                     state.viewporter = Some(registry.bind(name, 1, qh, ()));
+                }
+                "wl_data_device_manager" => {
+                    state.dnd.dd_manager = Some(registry.bind(name, version.min(3), qh, ()));
+                }
+                "wl_shm" => {
+                    state.dnd.shm = Some(registry.bind(name, 1, qh, ()));
                 }
                 _ => {}
             }
@@ -285,8 +897,28 @@ impl Dispatch<WlSeat, ()> for HostState {
 }
 
 impl Dispatch<WlPointer, ()> for HostState {
-    fn event(state: &mut Self, _: &WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(state: &mut Self, pointer: &WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match event {
+            // NOTE: do NOT hide the host cursor here (set_cursor None) until
+            // the slot renders its own cursor into screencopy frames. The
+            // headless slot currently draws no cursor, so hiding the host
+            // cursor leaves the viewer with no pointer at all (2026-10-19).
+            wl_pointer::Event::Enter { serial, .. } => {
+                state.dnd.pointer_inside = true;
+                state.dnd.escape_wanted = false;
+                state.dnd.last_enter_serial = Some(serial);
+                // Apply the badged head cursor (arrow tip at the pointer).
+                // Leaving the surface restores the compositor default.
+                if let Some(cursor) = &state.dnd.cursor {
+                    pointer.set_cursor(serial, Some(&cursor.surface), 6, 4);
+                }
+            }
+            wl_pointer::Event::Leave { .. } => {
+                // Leaving mid-drag is the escape signal: the main loop turns
+                // it into a host-side drag once payload data is cached.
+                state.dnd.pointer_inside = false;
+                state.dnd.escape_wanted = true;
+            }
             wl_pointer::Event::Motion { time, surface_x, surface_y } => {
                 state.pointer_events.push(PointerEvent::MotionAbsolute {
                     time,
@@ -294,8 +926,20 @@ impl Dispatch<WlPointer, ()> for HostState {
                     y: surface_y,
                 });
             }
-            wl_pointer::Event::Button { time, button, state: bstate, .. } => {
+            wl_pointer::Event::Button { serial, time, button, state: bstate } => {
                 if let WEnum::Value(bstate) = bstate {
+                    // Track the press serial and button state for DnD escape:
+                    // start_drag needs the serial of the press that began the
+                    // gesture, and escape is only valid while held.
+                    if button == BTN_LEFT {
+                        if bstate == ButtonState::Pressed {
+                            state.dnd.button_held = true;
+                            state.dnd.last_press_serial = Some(serial);
+                        } else {
+                            state.dnd.button_held = false;
+                            state.dnd.escape_wanted = false;
+                        }
+                    }
                     state.pointer_events.push(PointerEvent::Button {
                         time,
                         button,
@@ -303,9 +947,39 @@ impl Dispatch<WlPointer, ()> for HostState {
                     });
                 }
             }
+            wl_pointer::Event::AxisSource { axis_source } => {
+                if let WEnum::Value(source) = axis_source {
+                    state.pending_axis_source = source;
+                }
+            }
             wl_pointer::Event::Axis { time, axis, value } => {
                 if let WEnum::Value(axis) = axis {
-                    state.pointer_events.push(PointerEvent::Axis { time, axis, value });
+                    let idx = usize::from(matches!(axis, wl_pointer::Axis::HorizontalScroll));
+                    state.last_axis_value[idx] = value;
+                    state.pointer_events.push(PointerEvent::Axis {
+                        time,
+                        axis,
+                        value,
+                        source: state.pending_axis_source.clone(),
+                    });
+                }
+            }
+            wl_pointer::Event::AxisDiscrete { axis, discrete } => {
+                if let WEnum::Value(axis) = axis {
+                    let idx = usize::from(matches!(axis, wl_pointer::Axis::HorizontalScroll));
+                    let value = state.last_axis_value[idx];
+                    state.pointer_events.push(PointerEvent::AxisDiscrete {
+                        axis,
+                        value,
+                        discrete,
+                    });
+                }
+            }
+            wl_pointer::Event::AxisStop { time, axis } => {
+                if let WEnum::Value(axis) = axis {
+                    state
+                        .pointer_events
+                        .push(PointerEvent::AxisStop { time, axis });
                 }
             }
             wl_pointer::Event::Frame => {
@@ -321,6 +995,12 @@ impl Dispatch<WlKeyboard, ()> for HostState {
         match event {
             wl_keyboard::Event::Key { time, key, state: kstate, .. } => {
                 if let WEnum::Value(kstate) = kstate {
+                    // Key repeat is compositor-generated from the initial press
+                    // and the slot repeats from the press on its own, so forward
+                    // nothing here -- and never mistake a repeat for a release.
+                    if kstate == KeyState::Repeated {
+                        return;
+                    }
                     let is_pressed = kstate == KeyState::Pressed;
                     let state_val = if is_pressed { 1 } else { 0 };
 
@@ -440,6 +1120,219 @@ impl Dispatch<WlTouch, ()> for HostState {
                     state: ButtonState::Released,
                 });
                 state.pointer_events.push(PointerEvent::Frame);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlDataDeviceManager, ()> for HostState {
+    fn event(_: &mut Self, _: &WlDataDeviceManager, _: wayland_client::protocol::wl_data_device_manager::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<WlShm, ()> for HostState {
+    fn event(_: &mut Self, _: &WlShm, _: wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<WlShmPool, ()> for HostState {
+    fn event(_: &mut Self, _: &WlShmPool, _: wayland_client::protocol::wl_shm_pool::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<WlDataDevice, ()> for HostState {
+    event_created_child!(HostState, WlDataDevice, [
+        0 => (WlDataOffer, Default::default()),
+    ]);
+
+    fn event(state: &mut Self, _: &WlDataDevice, event: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            wl_data_device::Event::DataOffer { id } => {
+                if let Some(prev) = state.dnd.incoming_offer.take() {
+                    prev.destroy();
+                }
+                state.dnd.incoming_offer = Some(id);
+                state.dnd.incoming_mimes.clear();
+            }
+            wl_data_device::Event::Enter { serial, id, .. } => {
+                if state.dnd.host_drag_active {
+                    // Our own escaped drag hovering back over the viewer. We
+                    // never accept, so releasing here cancels the host drag;
+                    // the slot drag is already gone (cancelled at escape).
+                    println!("[nori-view] DnD own drag re-entered viewer; will not accept");
+                } else if let Some(offer) = id {
+                    // External host drag: inject into the slot and pull every
+                    // payload eagerly so slot targets never wait for bytes.
+                    let mimes = state.dnd.incoming_mimes.clone();
+                    println!("[nori-view] DnD host drag entered viewer: {mimes:?}");
+                    if mimes.is_empty() {
+                        return;
+                    }
+                    state.dnd.send_cmd(
+                        &serde_json::json!({"cmd": "external_drag_started", "mimes": mimes})
+                            .to_string(),
+                    );
+                    // Accept the first MIME so the host source sees a live
+                    // destination (v1 always copies).
+                    if let Some(first) = state.dnd.incoming_mimes.first().cloned() {
+                        offer.accept(serial, Some(first));
+                    }
+                    let (Some(writer), Some(cache)) =
+                        (state.dnd.writer.clone(), state.dnd.host_cache.clone())
+                    else {
+                        return;
+                    };
+                    cache.lock().map(|mut c| c.clear()).ok();
+                    for mime in state.dnd.incoming_mimes.clone() {
+                        spawn_host_receive(&offer, mime, writer.clone(), cache.clone());
+                    }
+                }
+            }
+            wl_data_device::Event::Leave => {
+                if let Some(offer) = state.dnd.incoming_offer.take() {
+                    offer.destroy();
+                }
+                state.dnd.incoming_mimes.clear();
+                if state.dnd.external_injected {
+                    state.dnd.external_injected = false;
+                    state
+                        .dnd
+                        .send_cmd(&serde_json::json!({"cmd": "external_drag_ended"}).to_string());
+                }
+            }
+            wl_data_device::Event::Drop => {
+                // Payloads were pushed eagerly at Enter; the slot-side drop
+                // itself flows through the forwarded button release.
+                println!("[nori-view] DnD host drop on viewer");
+                state.dnd.external_injected = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlDataOffer, ()> for HostState {
+    fn event(state: &mut Self, _: &WlDataOffer, event: wl_data_offer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            wl_data_offer::Event::Offer { mime_type } => {
+                println!("[nori-view] DnD incoming offer mime: {mime_type}");
+                if !state.dnd.incoming_mimes.contains(&mime_type) {
+                    state.dnd.incoming_mimes.push(mime_type);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Pull one host payload on a thread (blocking read would stall the frame
+/// loop), then cache it and push it to the slot.
+fn spawn_host_receive(
+    offer: &WlDataOffer,
+    mime: String,
+    writer: Arc<Mutex<UnixStream>>,
+    cache: Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>,
+) {
+    let (read, write) = match nix::unistd::pipe() {
+        Ok((read, write)) => (read, write),
+        Err(err) => {
+            println!("[nori-view] DnD pipe failed for {mime}: {err}");
+            cache.lock().map(|mut c| c.insert(mime.clone(), None)).ok();
+            push_failed(&writer, &mime);
+            return;
+        }
+    };
+    offer.receive(mime.clone(), write.as_fd());
+    // The fd is passed to the compositor; our copy can close.
+    drop(write);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let file = File::from(read);
+        let ok = file
+            .take(16 * 1024 * 1024)
+            .read_to_end(&mut bytes)
+            .is_ok();
+        println!(
+            "[nori-view] DnD host received {mime}: {} bytes (ok={ok})",
+            bytes.len()
+        );
+        cache
+            .lock()
+            .map(|mut c| c.insert(mime.clone(), ok.then(|| bytes.clone())))
+            .ok();
+        let Ok(mut sock) = writer.lock() else {
+            return;
+        };
+        if ok {
+            let header =
+                serde_json::json!({"cmd": "external_drag_data", "mime": mime, "len": bytes.len()})
+                    .to_string()
+                + "\n";
+            if sock.write_all(header.as_bytes()).is_ok() {
+                let _ = sock.write_all(&bytes);
+            }
+        } else {
+            let line =
+                serde_json::json!({"cmd": "external_drag_failed", "mime": mime}).to_string()
+                    + "\n";
+            let _ = sock.write_all(line.as_bytes());
+        }
+    });
+}
+
+fn push_failed(writer: &Arc<Mutex<UnixStream>>, mime: &str) {
+    let line =
+        serde_json::json!({"cmd": "external_drag_failed", "mime": mime}).to_string() + "\n";
+    if let Ok(mut sock) = writer.lock() {
+        let _ = sock.write_all(line.as_bytes());
+    }
+}
+
+impl Dispatch<WlDataSource, ()> for HostState {
+    fn event(state: &mut Self, source: &WlDataSource, event: wl_data_source::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            wl_data_source::Event::Target { mime_type } => {
+                println!("[nori-view] DnD host target accepted: {mime_type:?}");
+                // Badge follows acceptance: green check over a live target,
+                // neutral plus elsewhere. File glyphs persist from the cache.
+                let spec = state.icon_spec(mime_type.is_some());
+                if let Some(icon) = state.dnd.icon.as_mut() {
+                    icon.redraw(spec);
+                }
+            }
+            wl_data_source::Event::Send { mime_type, fd } => {
+                let payload = state
+                    .dnd
+                    .drag
+                    .as_ref()
+                    .and_then(|drag| drag.cache.get(&mime_type))
+                    .cloned()
+                    .unwrap_or_default();
+                println!(
+                    "[nori-view] DnD serving {mime_type} to host: {} bytes",
+                    payload.len()
+                );
+                let mut file = File::from(fd);
+                let _ = file.write_all(&payload);
+                // fd closed on drop: end of data.
+            }
+            wl_data_source::Event::Cancelled => {
+                println!("[nori-view] DnD host drag cancelled");
+                source.destroy();
+                state.dnd.source = None;
+                state.dnd_destroy_icon();
+                state.dnd.host_drag_active = false;
+            }
+            wl_data_source::Event::DndDropPerformed => {
+                println!("[nori-view] DnD host drop performed");
+            }
+            wl_data_source::Event::DndFinished => {
+                println!("[nori-view] DnD host drag finished");
+                source.destroy();
+                state.dnd.source = None;
+                state.dnd_destroy_icon();
+                state.dnd.host_drag_active = false;
+            }
+            wl_data_source::Event::Action { dnd_action } => {
+                println!("[nori-view] DnD host chose action {dnd_action:?} (v1 always copies)");
             }
             _ => {}
         }
@@ -1076,6 +1969,8 @@ fn main() -> Result<()> {
         height: target_state.height,
         pointer_events: Vec::new(),
         keyboard_events: Vec::new(),
+        pending_axis_source: wl_pointer::AxisSource::Wheel,
+        last_axis_value: [0.0; 2],
         held_keys: HashSet::new(),
         inhibitor_active: true,
         mod_held: false,
@@ -1086,6 +1981,7 @@ fn main() -> Result<()> {
         is_focused: true,
         last_unfocused_capture: None,
         closed: false,
+        dnd: DndBridge::default(),
     };
 
     let _host_registry = host_conn.display().get_registry(&host_qh, ());
@@ -1129,6 +2025,57 @@ fn main() -> Result<()> {
     // Inhibit host keyboard shortcuts when focused so Mod hotkeys reach slot
     if let (Some(inhibit_mgr), Some(seat)) = (&host_state.inhibit_manager, &host_state.seat) {
         host_state.inhibitor = Some(inhibit_mgr.inhibit_shortcuts(&host_surface, seat, &host_qh, ()));
+    }
+
+    // DnD bridge: host data device for drag injection, slot socket for export.
+    if let (Some(mgr), Some(seat)) = (host_state.dnd.dd_manager.clone(), host_state.seat.clone()) {
+        host_state.dnd.dd = Some(mgr.get_data_device(&seat, &host_qh, ()));
+    }
+    // Badged head cursor: numeral = head, accent = node (overridable).
+    let head_num = args.head_num.or(args.slot).unwrap_or(0);
+    let node = args.node.clone().unwrap_or_else(|| "local".to_string());
+    let accent = args
+        .accent
+        .as_deref()
+        .and_then(cursor::parse_accent)
+        .unwrap_or_else(|| cursor::accent_for_node(&node));
+    host_state.dnd.head_num = head_num;
+    host_state.dnd.accent = accent;
+    if let (Some(shm), Some(compositor)) =
+        (host_state.dnd.shm.clone(), host_state.compositor.clone())
+    {
+        let spec = cursor::CursorSpec::idle(head_num, accent);
+        host_state.dnd.cursor =
+            CursorSurface::create(&compositor, &shm, &host_qh, "cursor", spec);
+        println!("[nori-view] Head cursor ready: head={head_num} node={node}");
+    } else {
+        println!("[nori-view] Head cursor unavailable (no shm/compositor)");
+    }
+    let slot_no = args.slot.or_else(|| parse_slot_from_display(&target_display));
+    if let Some(slot) = slot_no {
+        let path = std::env::var("XDG_RUNTIME_DIR")
+            .map(|run| format!("{run}/nori-dnd-{slot}.sock"))
+            .unwrap_or_default();
+        match UnixStream::connect(&path) {
+            Ok(sock) => {
+                let _ = sock.set_nonblocking(true);
+                // Separate blocking writer connection: a dup'd clone would
+                // share O_NONBLOCK with the reader.
+                let writer = UnixStream::connect(&path)
+                    .ok()
+                    .map(|s| Arc::new(Mutex::new(s)));
+                host_state.dnd.writer = writer;
+                host_state.dnd.host_cache = Some(Arc::new(Mutex::new(HashMap::new())));
+                host_state.dnd.sock = Some(sock);
+                host_state.dnd.send_cmd(&serde_json::json!({"cmd": "watch"}).to_string());
+                println!("[nori-view] DnD watching {path}");
+            }
+            Err(err) => {
+                println!("[nori-view] DnD unavailable ({path}): {err}");
+            }
+        }
+    } else {
+        println!("[nori-view] DnD disabled: cannot determine slot number");
     }
 
     host_surface.commit();
@@ -1274,6 +2221,12 @@ fn main() -> Result<()> {
         // Dispatch host events (user input, window resizes)
         host_queue.dispatch_pending(&mut host_state)?;
 
+        // DnD bridge: pump the slot socket, then escalate any drag that left
+        // the viewer surface into a host-side drag.
+        host_state.dnd.pump();
+        host_state.dnd_maybe_escape(&host_qh);
+        host_state.sync_cursor();
+
         // Forward pointer events from host to target
         if let Some(vp) = &virtual_pointer {
             for event in host_state.pointer_events.drain(..) {
@@ -1286,9 +2239,28 @@ fn main() -> Result<()> {
                     PointerEvent::Button { time, button, state } => {
                         vp.button(time, button, state);
                     }
-                    PointerEvent::Axis { time, axis, value } => {
-                        vp.axis_source(wayland_client::protocol::wl_pointer::AxisSource::Wheel);
+                    // Axis contract: forward values and source unchanged. The host
+                    // libinput already applied the user's natural-scroll
+                    // preference; the headless slot has no libinput devices, so
+                    // it interprets these raw values as-is. Never negate here.
+                    PointerEvent::Axis {
+                        time,
+                        axis,
+                        value,
+                        source,
+                    } => {
+                        vp.axis_source(source);
                         vp.axis(time, axis, value);
+                    }
+                    PointerEvent::AxisDiscrete {
+                        axis,
+                        value,
+                        discrete,
+                    } => {
+                        vp.axis_discrete(0, axis, value, discrete);
+                    }
+                    PointerEvent::AxisStop { time, axis } => {
+                        vp.axis_stop(time, axis);
                     }
                     PointerEvent::Frame => {
                         vp.frame();
@@ -1419,6 +2391,216 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<Option<String>> {
         list.iter().map(|s| Some(s.to_string())).collect()
+    }
+
+    #[test]
+    fn dnd_parser_splits_lines_and_data_frames() {
+        let mut parser = DndSockParser::default();
+        // Two JSON lines in one chunk.
+        let events = parser.push(
+            b"{\"event\":\"watching\",\"gen\":1}\n{\"event\":\"drag_started\",\"gen\":2,\"mimes\":[\"text/plain\"]}\n",
+        );
+        assert_eq!(
+            events,
+            vec![
+                DndSockEvent::Watching { gen: 1 },
+                DndSockEvent::DragStarted {
+                    gen: 2,
+                    mimes: vec!["text/plain".to_string()],
+                },
+            ]
+        );
+        // Data header split across chunks, then split payload.
+        let events = parser.push(b"{\"event\":\"data\",\"id\":7,\"mime\":\"text/plain\",\"len\":10}\nhello");
+        assert!(events.is_empty());
+        let events = parser.push(b" worl\n{\"event\":\"pong\"}\n");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            DndSockEvent::Data {
+                id: 7,
+                mime: "text/plain".to_string(),
+                bytes: b"hello worl".to_vec(),
+            }
+        );
+        assert_eq!(events[1], DndSockEvent::Pong);
+    }
+
+    #[test]
+    fn dnd_parser_external_events() {
+        let mut parser = DndSockParser::default();
+        let events = parser.push(
+            b"{\"event\":\"external_started\",\"ok\":true}\n{\"event\":\"need_data\",\"mime\":\"text/html\"}\n",
+        );
+        assert_eq!(
+            events,
+            vec![
+                DndSockEvent::ExternalStarted { ok: true },
+                DndSockEvent::NeedData {
+                    mime: "text/html".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dnd_parser_skips_garbage_lines() {
+        let mut parser = DndSockParser::default();
+        let events = parser.push(b"not json\n{\"event\":\"pong\"}\n");
+        assert_eq!(events, vec![DndSockEvent::Pong]);
+    }
+
+
+    fn cursor_pixel(buf: &[u8], x: i32, y: i32) -> [u8; 4] {
+        let px = &buf[(y * cursor::ICON_STRIDE + x * 4) as usize..][..4];
+        [px[0], px[1], px[2], px[3]]
+    }
+
+    #[test]
+    fn cursor_composer_idle_has_arrow_and_numeral() {
+        let spec = cursor::CursorSpec::idle(1, cursor::ACCENTS[0].1);
+        let buf = cursor::compose_cursor(&spec);
+        assert_eq!(buf.len(), (cursor::ICON_SIZE * cursor::ICON_STRIDE) as usize);
+        assert_eq!(cursor_pixel(&buf, 63, 0), [0, 0, 0, 0]);
+        assert_eq!(cursor_pixel(&buf, 8, 12), [255, 255, 255, 255]);
+        // Numeral badge rim is accent; digit stroke is white.
+        assert_eq!(cursor_pixel(&buf, 50, 4), cursor::ACCENTS[0].1);
+        assert_eq!(cursor_pixel(&buf, 50, 12), [255, 255, 255, 255]);
+        // Different heads differ.
+        let other = cursor::compose_cursor(&cursor::CursorSpec::idle(2, cursor::ACCENTS[0].1));
+        assert_ne!(buf, other);
+    }
+
+    #[test]
+    fn cursor_composer_file_drag_shows_glyph_and_badges() {
+        let spec = cursor::CursorSpec {
+            numeral: 1,
+            accent: cursor::ACCENTS[0].1,
+            files: vec![cursor::FileClass::Image],
+            file_count: 1,
+            drag: Some(cursor::DragBadge::Neutral),
+        };
+        let buf = cursor::compose_cursor(&spec);
+        // Page body (below the band, away from symbols).
+        assert_eq!(cursor_pixel(&buf, 12, 30), [255, 255, 255, 255]);
+        // State badge present.
+        assert_eq!(cursor_pixel(&buf, 52, 52), [255, 130, 70, 255]);
+        // Numeral still visible.
+        assert_eq!(cursor_pixel(&buf, 50, 4), cursor::ACCENTS[0].1);
+    }
+
+    #[test]
+    fn uri_classifier_maps_common_types() {
+        use cursor::{classify_uri, FileClass};
+        assert_eq!(classify_uri("file:///tmp/photo.PNG"), FileClass::Image);
+        assert_eq!(classify_uri("file:///v/clip.mkv"), FileClass::Video);
+        assert_eq!(classify_uri("file:///m/song.flac"), FileClass::Audio);
+        assert_eq!(classify_uri("file:///d/paper.pdf"), FileClass::Pdf);
+        assert_eq!(classify_uri("file:///d/notes.md"), FileClass::Doc);
+        assert_eq!(classify_uri("file:///d/a.tar.gz"), FileClass::Archive);
+        assert_eq!(classify_uri("file:///s/main.rs"), FileClass::Code);
+        assert_eq!(classify_uri("file:///home/u/"), FileClass::Folder);
+        assert_eq!(classify_uri("https://example.com/x"), FileClass::Link);
+        assert_eq!(classify_uri("file:///tmp/README"), FileClass::Generic);
+        let (classes, count) = cursor::classify_uris(
+            "file:///a.png\n# comment\n\nfile:///b.pdf\nfile:///c/\nfile:///d.mp3\n",
+        );
+        assert_eq!(count, 4);
+        assert_eq!(
+            classes,
+            vec![FileClass::Image, FileClass::Pdf, FileClass::Folder]
+        );
+    }
+
+    #[test]
+    fn accent_selection_prefers_explicit_then_node() {
+        assert_eq!(
+            cursor::parse_accent("green"),
+            Some(cursor::ACCENTS[1].1)
+        );
+        assert_eq!(cursor::parse_accent("#ff0000"), Some([0, 0, 255, 255]));
+        assert_eq!(cursor::parse_accent("bogus"), None);
+        assert_eq!(cursor::accent_for_node("local"), cursor::ACCENTS[0].1);
+        // Unknown nodes are stable across calls.
+        assert_eq!(
+            cursor::accent_for_node("node-east"),
+            cursor::accent_for_node("node-east")
+        );
+    }
+
+    #[test]
+    fn cursor_spec_tracks_drag_files() {
+        let mut state = HostState {
+            compositor: None,
+            xdg_wm_base: None,
+            linux_dmabuf: None,
+            dmabuf_feedback: FeedbackCollector::default(),
+            dmabuf_feedback_obj: None,
+            seat: None,
+            inhibit_manager: None,
+            inhibitor: None,
+            viewporter: None,
+            viewport: None,
+            surface: None,
+            xdg_surface: None,
+            toplevel: None,
+            pointer: None,
+            keyboard: None,
+            touch: None,
+            configured: false,
+            width: 0,
+            height: 0,
+            pointer_events: Vec::new(),
+            keyboard_events: Vec::new(),
+            pending_axis_source: wl_pointer::AxisSource::Wheel,
+            last_axis_value: [0.0; 2],
+            held_keys: HashSet::new(),
+            inhibitor_active: false,
+            mod_held: false,
+            shift_held: false,
+            buffer_busy: Vec::new(),
+            frame_done: true,
+            is_fullscreen: false,
+            is_focused: true,
+            last_unfocused_capture: None,
+            closed: false,
+            dnd: DndBridge::default(),
+        };
+        state.dnd.head_num = 1;
+        state.dnd.accent = cursor::ACCENTS[0].1;
+        assert_eq!(state.cursor_spec().drag, None);
+        assert!(state.cursor_spec().files.is_empty());
+        // Live internal URI drag -> file composition.
+        state.dnd.pointer_inside = true;
+        state.dnd.button_held = true;
+        let mut cache = HashMap::new();
+        cache.insert(
+            "text/uri-list".to_string(),
+            b"file:///tmp/a.png\n".to_vec(),
+        );
+        state.dnd.drag = Some(SlotDrag {
+            cache,
+            ..SlotDrag::default()
+        });
+        let spec = state.cursor_spec();
+        assert_eq!(spec.drag, Some(cursor::DragBadge::Neutral));
+        assert_eq!(spec.files, vec![cursor::FileClass::Image]);
+        // Escaped: cursor returns to idle (the icon carries the drag).
+        state.dnd.drag.as_mut().unwrap().escaped = true;
+        let spec = state.cursor_spec();
+        assert_eq!(spec.drag, None);
+        assert!(spec.files.is_empty());
+    }
+
+    #[test]
+    fn parse_slot_from_display_handles_paths() {
+        assert_eq!(parse_slot_from_display("wayland-nori-1"), Some(1));
+        assert_eq!(
+            parse_slot_from_display("/run/user/1000/wayland-nori-2"),
+            Some(2)
+        );
+        assert_eq!(parse_slot_from_display("wayland-0"), Some(0));
+        assert_eq!(parse_slot_from_display("nope"), None);
     }
 
     #[test]

@@ -156,6 +156,7 @@ use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
+use crate::protocols::nori_dnd::NoriDndState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{
     Screencopy, ScreencopyBuffer, ScreencopyManagerState, capture_covers_full_output,
@@ -368,6 +369,9 @@ pub struct Niri {
     pub cursor_texture_cache: CursorTextureCache,
     pub cursor_shape_manager_state: CursorShapeManagerState,
     pub dnd_icon: Option<DndIcon>,
+
+    /// Slot → viewer drag-and-drop export channel (headless slots only).
+    pub nori_dnd: NoriDndState,
     /// Contents under pointer.
     ///
     /// Periodically updated: on motion and other events and in the loop callback. If you require
@@ -2789,6 +2793,7 @@ impl Niri {
             cursor_texture_cache: Default::default(),
             cursor_shape_manager_state,
             dnd_icon: None,
+            nori_dnd: NoriDndState::default(),
             pointer_contents: PointContents::default(),
             pointer_visibility: PointerVisibility::Visible,
             pointer_inactivity_timer: None,
@@ -2851,6 +2856,8 @@ impl Niri {
         };
 
         niri.reset_pointer_inactivity_timer();
+
+        niri.nori_dnd_setup();
 
         niri
     }

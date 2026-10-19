@@ -1,8 +1,19 @@
 //! Z-Axis Slot Gesture Passthrough & Inhibit Control
 //!
-//! Provides intelligent locking and passthrough for touchpad and touchscreen gestures
-//! when focused on nori slot viewers (e.g. nori-viewer / wlvncc), nested nori sessions,
-//! or shortcut-inhibiting surfaces.
+//! Routes host-captured gestures to nori slots as discrete IPC actions when a
+//! slot viewer is focused. There is no raw gesture event stream to slots (no
+//! virtual-gesture protocol exists); this action matrix IS the head1 gesture
+//! protocol until a libei-based input connection replaces it.
+//!
+//! Matrix (fired once at gesture end; host gestures animate live, slots jump):
+//! - 3-finger / 3-touch horizontal swipe -> focus-column-{left,right}
+//! - 3-finger / 3-touch vertical swipe   -> focus-workspace-{up,down}
+//! - 4-finger / 4+-touch swipe           -> toggle-overview
+//! Thresholds: 25.0 (trackpad gesture units) / 30.0 (touch average pixels).
+//!
+//! Known gaps (see also: libei future): pinch in/out, press-and-hold, live
+//! gesture tracking in slots, wlvncc fallback viewer tag parsing, and
+//! per-gesture remote transport beyond one SSH call per action.
 
 use std::collections::HashMap;
 use smithay::backend::input::TouchSlot;
@@ -101,10 +112,17 @@ pub fn send_slot_action(slot: u32, node: Option<&str>, action: &str) {
     });
 }
 
-/// Locates the most recent niri IPC socket for the specified slot.
+/// Locates the niri IPC socket for the specified slot.
+///
+/// Prefers the canonical `ipc-headN.sock` link; falls back to a newest-match
+/// glob scan for environments where the link was never created.
 fn find_slot_socket(slot: u32) -> Option<std::path::PathBuf> {
     let uid = unsafe { libc::getuid() };
     let run_user = format!("/run/user/{uid}");
+    let canonical = std::path::PathBuf::from(format!("{run_user}/ipc-head{slot}.sock"));
+    if canonical.exists() {
+        return Some(canonical);
+    }
     let prefix = format!("niri.wayland-nori-{slot}.");
     let mut matching = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&run_user) {
@@ -122,4 +140,36 @@ fn find_slot_socket(slot: u32) -> Option<std::path::PathBuf> {
     }
     matching.sort_by_key(|&(mtime, _)| mtime);
     matching.pop().map(|(_, path)| path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_slot_info;
+
+    #[test]
+    fn parses_local_viewer_app_id() {
+        let info = parse_slot_info(Some("nori-viewer-s1-h1"), "").unwrap();
+        assert_eq!(info.slot, 1);
+        assert_eq!(info.node, None);
+    }
+
+    #[test]
+    fn parses_remote_viewer_app_id() {
+        let info = parse_slot_info(Some("nori-viewer-s1-inspiron-h1"), "").unwrap();
+        assert_eq!(info.slot, 1);
+        assert_eq!(info.node.as_deref(), Some("inspiron"));
+    }
+
+    #[test]
+    fn falls_back_to_title() {
+        let info = parse_slot_info(Some("unknown"), "nori-viewer:head1:slot2").unwrap();
+        assert_eq!(info.slot, 2);
+        assert_eq!(info.node, None);
+    }
+
+    #[test]
+    fn rejects_non_viewer_windows() {
+        assert!(parse_slot_info(Some("Alacritty"), "super@tp:~").is_none());
+        assert!(parse_slot_info(None, "Workspace Overview").is_none());
+    }
 }
