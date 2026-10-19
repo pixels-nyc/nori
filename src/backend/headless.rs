@@ -1,5 +1,6 @@
 //! Headless backend for tests and persistent multi-tenant session spaces.
 
+use std::collections::HashMap;
 use std::mem;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,7 @@ use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
+use crate::handlers::image_copy_capture;
 use crate::niri::{Niri, RedrawState};
 use crate::render_helpers::{resources, shaders};
 use crate::utils::{get_monotonic_time, logical_output};
@@ -94,6 +96,66 @@ fn detect_physical_displays() -> Vec<(u16, u16)> {
     displays
 }
 
+/// Standby drain rate for unviewed headless outputs.
+fn standby_fps() -> u64 {
+    std::env::var("NORI_STANDBY_FPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BurstState {
+    Live(Option<u64>),
+    Expired,
+    Invalid,
+}
+
+/// Parses an agent burst trigger file: "<expires_epoch_millis> [target_fps]".
+fn parse_burst_trigger(content: &str, now_ms: u128) -> BurstState {
+    let mut parts = content.split_whitespace();
+    let Some(exp_str) = parts.next() else {
+        return BurstState::Invalid;
+    };
+    let Ok(exp_ms) = exp_str.parse::<u128>() else {
+        return BurstState::Invalid;
+    };
+    if now_ms >= exp_ms {
+        return BurstState::Expired;
+    }
+    let fps = parts.next().and_then(|s| s.parse::<u64>().ok());
+    BurstState::Live(fps)
+}
+
+/// Reads the agent burst trigger file, removing it once expired.
+///
+/// Returns (burst active, fps override).
+fn burst_trigger() -> (bool, Option<u64>) {
+    let Ok(slot_str) =
+        std::env::var("NORI_HEADLESS_SLOT").or_else(|_| std::env::var("PIXOS_HEAD"))
+    else {
+        return (false, None);
+    };
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+    let burst_path = format!("{}/nori-burst-{}", runtime_dir, slot_str);
+    let Ok(content) = std::fs::read_to_string(&burst_path) else {
+        return (false, None);
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    match parse_burst_trigger(&content, now_ms) {
+        BurstState::Live(fps) => (true, fps),
+        BurstState::Expired => {
+            let _ = std::fs::remove_file(&burst_path);
+            (false, None)
+        }
+        BurstState::Invalid => (false, None),
+    }
+}
+
 pub struct Headless {
     renderer: Option<GlesRenderer>,
     render_node: Option<DrmNode>,
@@ -103,6 +165,7 @@ pub struct Headless {
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     last_render_time: Option<Duration>,
     forced_active: bool,
+    standby_last_send: HashMap<Output, Duration>,
 }
 
 impl Headless {
@@ -116,6 +179,7 @@ impl Headless {
             ipc_outputs: Default::default(),
             last_render_time: None,
             forced_active: false,
+            standby_last_send: HashMap::new(),
         }
     }
 
@@ -305,33 +369,11 @@ impl Headless {
             .and_then(|s| s.parse().ok())
             .unwrap_or(60);
 
-        // Check for agent burst trigger file /run/user/{uid}/nori-burst-{slot}
-        let mut burst_active = false;
-        if let Ok(slot_str) = std::env::var("NORI_HEADLESS_SLOT").or_else(|_| std::env::var("PIXOS_HEAD")) {
-            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-                .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
-            let burst_path = format!("{}/nori-burst-{}", runtime_dir, slot_str);
-            if let Ok(content) = std::fs::read_to_string(&burst_path) {
-                // Format: "<expires_epoch_millis> [target_fps]"
-                let parts: Vec<&str> = content.split_whitespace().collect();
-                if let Some(exp_str) = parts.first() {
-                    if let Ok(exp_ms) = exp_str.parse::<u128>() {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        if now_ms < exp_ms {
-                            burst_active = true;
-                            if let Some(fps_str) = parts.get(1) {
-                                if let Ok(f) = fps_str.parse::<u64>() {
-                                    active_fps = f.max(1);
-                                }
-                            }
-                        } else {
-                            let _ = std::fs::remove_file(&burst_path);
-                        }
-                    }
-                }
+        // Agent burst hold forces full rate (see burst_trigger).
+        let (burst_active, burst_fps) = burst_trigger();
+        if burst_active {
+            if let Some(fps) = burst_fps {
+                active_fps = fps.max(1);
             }
         }
 
@@ -396,6 +438,113 @@ impl Headless {
         RenderResult::Submitted
     }
 
+    /// Whether anything needs full-rate frames from a headless output:
+    /// capture clients, PipeWire screencasts, or an agent burst hold.
+    fn output_has_viewer_demand(&self, niri: &Niri, output: &Output) -> bool {
+        if self.forced_active {
+            return true;
+        }
+        if burst_trigger().0 {
+            return true;
+        }
+        if niri.screencopy_state.has_active_cast_for_output(output) {
+            return true;
+        }
+        if niri.image_copy_sessions.iter().any(|s| {
+            s.pending_frame.is_some()
+                && image_copy_capture::source_output(&s.session.source())
+                    .is_some_and(|src| src == *output)
+        }) {
+            return true;
+        }
+        if niri.image_copy_cursor_sessions.iter().any(|s| {
+            s.pending_frame.is_some()
+                && image_copy_capture::source_output(&s.session.source())
+                    .is_some_and(|src| src == *output)
+        }) {
+            return true;
+        }
+        #[cfg(feature = "xdp-gnome-screencast")]
+        {
+            let weak = output.downgrade();
+            if niri
+                .casting
+                .casts
+                .iter()
+                .any(|cast| cast.is_active() && cast.target.matches_output(&weak))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Runs a standby drain instead of a full redraw when a headless output
+    /// has no presentation demand.
+    ///
+    /// Client commits between standby ticks coalesce on the re-armed timer,
+    /// so an aggressive background client costs one cheap drain per tick
+    /// instead of a full scene pass per commit. Returns true when the redraw
+    /// was handled here; false means the caller must run the full path now
+    /// (demand appeared, e.g. a viewer just attached).
+    pub fn try_standby_redraw(&mut self, niri: &mut Niri, output: &Output) -> bool {
+        if self.output_has_viewer_demand(niri, output) {
+            return false;
+        }
+
+        let interval = Duration::from_millis(1000 / standby_fps().max(1));
+        let now = get_monotonic_time();
+
+        // Pace frame callbacks to the standby rate. Without this, callback
+        // driven clients would ping-pong a redraw per commit at full rate.
+        let due = self
+            .standby_last_send
+            .get(output)
+            .map(|last| now - *last >= interval)
+            .unwrap_or(true);
+        if due {
+            {
+                let output_state = niri.output_state.get_mut(output).unwrap();
+                output_state.frame_callback_sequence =
+                    output_state.frame_callback_sequence.wrapping_add(1);
+            }
+            niri.send_frame_callbacks(output);
+            // Nothing is presented in standby; report discarded honestly.
+            let states = RenderElementStates::default();
+            let mut feedbacks = niri.take_presentation_feedbacks(output, &states);
+            feedbacks.discarded();
+            self.standby_last_send.insert(output.clone(), now);
+        }
+
+        // Consume the queued state, preserving any live standby timer so
+        // continuous commits cannot starve the tick by re-arming it.
+        let output_state = niri.output_state.get_mut(output).unwrap();
+        match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+            RedrawState::Queued => {
+                let timer = Timer::from_duration(interval);
+                let output_clone = output.clone();
+                let token = niri
+                    .event_loop
+                    .insert_source(timer, move |_, _, data| {
+                        data.niri.queue_redraw(&output_clone);
+                        TimeoutAction::Drop
+                    })
+                    .ok();
+                if let Some(token) = token {
+                    output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+                }
+            }
+            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+                output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+            }
+            other => {
+                output_state.redraw_state = other;
+            }
+        }
+
+        true
+    }
+
     pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
         if let Some(renderer) = &mut self.renderer {
             renderer.import_dmabuf(dmabuf, None).is_ok()
@@ -427,5 +576,46 @@ impl Headless {
 impl Default for Headless {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_burst_trigger;
+    use super::BurstState;
+
+    #[test]
+    fn burst_live_with_fps_override() {
+        assert_eq!(
+            parse_burst_trigger("2000000000000 30\n", 1000),
+            BurstState::Live(Some(30))
+        );
+    }
+
+    #[test]
+    fn burst_live_without_fps_keeps_default() {
+        assert_eq!(
+            parse_burst_trigger("2000000000000\n", 1000),
+            BurstState::Live(None)
+        );
+        assert_eq!(
+            parse_burst_trigger("2000000000000 fast\n", 1000),
+            BurstState::Live(None)
+        );
+    }
+
+    #[test]
+    fn burst_expired_at_deadline() {
+        assert_eq!(
+            parse_burst_trigger("1000 60\n", 1000),
+            BurstState::Expired
+        );
+        assert_eq!(parse_burst_trigger("999\n", 1000), BurstState::Expired);
+    }
+
+    #[test]
+    fn burst_garbage_is_invalid() {
+        assert_eq!(parse_burst_trigger("", 1000), BurstState::Invalid);
+        assert_eq!(parse_burst_trigger("soon 60\n", 1000), BurstState::Invalid);
     }
 }
