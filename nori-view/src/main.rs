@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use gbm::{BufferObject, BufferObjectFlags, Device, Format};
+use gbm::{BufferObject, BufferObjectFlags, Device, Format, Modifier};
 
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
+    wl_callback::WlCallback,
     wl_compositor::WlCompositor,
     wl_keyboard::{self, KeyState, WlKeyboard},
     wl_output::{self, WlOutput},
@@ -20,7 +21,7 @@ use wayland_client::protocol::{
     wl_surface::WlSurface,
     wl_touch::{self, WlTouch},
 };
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
     zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
@@ -28,6 +29,7 @@ use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
 };
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+    zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
     zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
 };
 use wayland_protocols::wp::viewporter::client::{
@@ -93,7 +95,6 @@ struct Args {
 }
 
 struct DmaBuffer {
-    id: usize,
     _bo: BufferObject<()>,
     target_buffer: WlBuffer,
     host_buffer: WlBuffer,
@@ -107,6 +108,8 @@ struct HostState {
     compositor: Option<WlCompositor>,
     xdg_wm_base: Option<XdgWmBase>,
     linux_dmabuf: Option<ZwpLinuxDmabufV1>,
+    dmabuf_feedback: FeedbackCollector,
+    dmabuf_feedback_obj: Option<ZwpLinuxDmabufFeedbackV1>,
     seat: Option<WlSeat>,
     inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
@@ -132,6 +135,7 @@ struct HostState {
     mod_held: bool,
     shift_held: bool,
     buffer_busy: Vec<bool>,
+    frame_done: bool,
     is_fullscreen: bool,
     is_focused: bool,
     last_unfocused_capture: Option<std::time::Instant>,
@@ -446,6 +450,12 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for HostState {
     fn event(_: &mut Self, _: &ZwpLinuxDmabufV1, _: wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for HostState {
+    fn event(state: &mut Self, _: &ZwpLinuxDmabufFeedbackV1, event: zwp_linux_dmabuf_feedback_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        handle_feedback_event(&mut state.dmabuf_feedback, event);
+    }
+}
+
 impl Dispatch<ZwpLinuxBufferParamsV1, usize> for HostState {
     fn event(_: &mut Self, _: &ZwpLinuxBufferParamsV1, _: zwp_linux_buffer_params_v1::Event, _: &usize, _: &Connection, _: &QueueHandle<Self>) {}
 }
@@ -456,6 +466,14 @@ impl Dispatch<WlBuffer, usize> for HostState {
             if *id < state.buffer_busy.len() {
                 state.buffer_busy[*id] = false;
             }
+        }
+    }
+}
+
+impl Dispatch<WlCallback, ()> for HostState {
+    fn event(state: &mut Self, _: &WlCallback, event: wayland_client::protocol::wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let wayland_client::protocol::wl_callback::Event::Done { .. } = event {
+            state.frame_done = true;
         }
     }
 }
@@ -493,12 +511,108 @@ impl Dispatch<WpViewport, ()> for HostState {
 // Target State & Handlers
 // ---------------------------------------------------------------------------
 
+struct TargetOutput {
+    output: WlOutput,
+    name: Option<String>,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DamageRect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+/// One preference tranche from zwp_linux_dmabuf_feedback_v1, kept in the
+/// descending preference order the compositor sent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FeedbackTranche {
+    scanout: bool,
+    /// (fourcc, modifier) pairs in format-table order.
+    formats: Vec<(u32, u64)>,
+}
+
+/// Assembled default feedback from one compositor.
+#[derive(Clone, Debug, Default)]
+struct DmabufFeedback {
+    tranches: Vec<FeedbackTranche>,
+    done: bool,
+}
+
+/// Incremental collector for feedback events on one connection.
+#[derive(Clone, Debug, Default)]
+struct FeedbackCollector {
+    table: Vec<(u32, u64)>,
+    tranches: Vec<FeedbackTranche>,
+    pending_scanout: bool,
+    pending_formats: Vec<(u32, u64)>,
+    done: bool,
+}
+
+impl FeedbackCollector {
+    fn push_table(&mut self, entries: Vec<(u32, u64)>) {
+        self.table = entries;
+    }
+
+    fn push_tranche_flags(&mut self, scanout: bool) {
+        self.pending_scanout = scanout;
+    }
+
+    fn push_tranche_formats(&mut self, indices: &[u16]) {
+        for idx in indices {
+            if let Some(entry) = self.table.get(*idx as usize) {
+                self.pending_formats.push(*entry);
+            }
+        }
+    }
+
+    fn end_tranche(&mut self) {
+        self.tranches.push(FeedbackTranche {
+            scanout: self.pending_scanout,
+            formats: std::mem::take(&mut self.pending_formats),
+        });
+        self.pending_scanout = false;
+    }
+
+    fn finish(&mut self) {
+        self.done = true;
+    }
+
+    fn snapshot(&self) -> DmabufFeedback {
+        DmabufFeedback { tranches: self.tranches.clone(), done: self.done }
+    }
+}
+
+fn handle_feedback_event(collector: &mut FeedbackCollector, event: zwp_linux_dmabuf_feedback_v1::Event) {
+    match event {
+        zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, .. } => {
+            collector.push_table(read_format_table_fd(fd));
+        }
+        zwp_linux_dmabuf_feedback_v1::Event::TrancheFlags { flags } => {
+            let scanout = matches!(flags, WEnum::Value(f) if f.contains(zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout));
+            collector.push_tranche_flags(scanout);
+        }
+        zwp_linux_dmabuf_feedback_v1::Event::TrancheFormats { indices } => {
+            collector.push_tranche_formats(&parse_tranche_indices(&indices));
+        }
+        zwp_linux_dmabuf_feedback_v1::Event::TrancheDone => collector.end_tranche(),
+        zwp_linux_dmabuf_feedback_v1::Event::Done => collector.finish(),
+        _ => {}
+    }
+}
+
 struct TargetState {
     seat: Option<WlSeat>,
-    output: Option<WlOutput>,
+    outputs: Vec<TargetOutput>,
     output_name: String,
+    selected: Option<usize>,
     screencopy_manager: Option<ZwlrScreencopyManagerV1>,
     linux_dmabuf: Option<ZwpLinuxDmabufV1>,
+    dmabuf_feedback: FeedbackCollector,
+    dmabuf_feedback_obj: Option<ZwpLinuxDmabufFeedbackV1>,
     virtual_pointer_mgr: Option<ZwlrVirtualPointerManagerV1>,
     virtual_pointer: Option<ZwlrVirtualPointerV1>,
     virtual_keyboard_mgr: Option<ZwpVirtualKeyboardManagerV1>,
@@ -506,10 +620,12 @@ struct TargetState {
 
     width: u32,
     height: u32,
-    ready_to_capture: bool,
-    frame_ready: bool,
-    frame_failed: bool,
-    active_frame_buffer_idx: Option<usize>,
+    /// Damage rects accumulated per in-flight capture (keyed by buffer index).
+    frame_damage: HashMap<usize, Vec<DamageRect>>,
+    /// Captures that completed since the last drain: (buffer index, damage).
+    completed: Vec<(usize, Vec<DamageRect>)>,
+    /// Buffer indexes whose capture failed since the last drain.
+    failed: Vec<usize>,
 }
 
 impl Dispatch<WlRegistry, ()> for TargetState {
@@ -528,10 +644,14 @@ impl Dispatch<WlRegistry, ()> for TargetState {
                     state.seat = Some(seat);
                 }
                 "wl_output" => {
-                    let out = registry.bind(name, version.min(4), qh, ());
-                    if state.output.is_none() {
-                        state.output = Some(out);
-                    }
+                    let idx = state.outputs.len();
+                    let out = registry.bind(name, version.min(4), qh, idx);
+                    state.outputs.push(TargetOutput {
+                        output: out,
+                        name: None,
+                        width: 0,
+                        height: 0,
+                    });
                 }
                 "zwlr_screencopy_manager_v1" => {
                     state.screencopy_manager = Some(registry.bind(name, version.min(3), qh, ()));
@@ -554,22 +674,22 @@ impl Dispatch<WlRegistry, ()> for TargetState {
     }
 }
 
-impl Dispatch<WlOutput, ()> for TargetState {
-    fn event(state: &mut Self, _: &WlOutput, event: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+impl Dispatch<WlOutput, usize> for TargetState {
+    fn event(state: &mut Self, _: &WlOutput, event: wl_output::Event, idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
+        let Some(entry) = state.outputs.get_mut(*idx) else {
+            return;
+        };
         match event {
             wl_output::Event::Mode { width, height, flags, .. } => {
                 if let WEnum::Value(flags) = flags {
-                    if flags.contains(wl_output::Mode::Current) || state.width == 0 {
-                        state.width = width as u32;
-                        state.height = height as u32;
-                        state.ready_to_capture = true;
+                    if flags.contains(wl_output::Mode::Current) || entry.width == 0 {
+                        entry.width = width as u32;
+                        entry.height = height as u32;
                     }
                 }
             }
             wl_output::Event::Name { name } => {
-                if name == state.output_name {
-                    // Matched desired output
-                }
+                entry.name = Some(name);
             }
             _ => {}
         }
@@ -583,13 +703,26 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for TargetState {
 impl Dispatch<ZwlrScreencopyFrameV1, usize> for TargetState {
     fn event(state: &mut Self, frame: &ZwlrScreencopyFrameV1, event: zwlr_screencopy_frame_v1::Event, buffer_idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
         match event {
+            zwlr_screencopy_frame_v1::Event::Damage { x, y, width, height } => {
+                state
+                    .frame_damage
+                    .entry(*buffer_idx)
+                    .or_default()
+                    .push(DamageRect {
+                        x: x as i32,
+                        y: y as i32,
+                        w: width as i32,
+                        h: height as i32,
+                    });
+            }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
-                state.frame_ready = true;
-                state.active_frame_buffer_idx = Some(*buffer_idx);
+                let damage = state.frame_damage.remove(buffer_idx).unwrap_or_default();
+                state.completed.push((*buffer_idx, damage));
                 frame.destroy();
             }
             zwlr_screencopy_frame_v1::Event::Failed => {
-                state.frame_failed = true;
+                state.frame_damage.remove(buffer_idx);
+                state.failed.push(*buffer_idx);
                 frame.destroy();
             }
             _ => {}
@@ -599,6 +732,12 @@ impl Dispatch<ZwlrScreencopyFrameV1, usize> for TargetState {
 
 impl Dispatch<ZwpLinuxDmabufV1, ()> for TargetState {
     fn event(_: &mut Self, _: &ZwpLinuxDmabufV1, _: wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for TargetState {
+    fn event(state: &mut Self, _: &ZwpLinuxDmabufFeedbackV1, event: zwp_linux_dmabuf_feedback_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        handle_feedback_event(&mut state.dmabuf_feedback, event);
+    }
 }
 
 impl Dispatch<ZwpLinuxBufferParamsV1, usize> for TargetState {
@@ -640,6 +779,177 @@ fn resolve_socket_path(name_or_path: &str) -> PathBuf {
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid()));
         Path::new(&runtime_dir).join(name_or_path)
     }
+}
+
+/// Pick the target output index for `--output`.
+///
+/// Prefers an exact name match. Falls back to the lone output only when its
+/// name has not been advertised yet, so a typo never silently captures the
+/// wrong head on a multi-output slot.
+fn select_output_index(names: &[Option<String>], wanted: &str) -> Option<usize> {
+    if let Some(idx) = names.iter().position(|n| n.as_deref() == Some(wanted)) {
+        return Some(idx);
+    }
+    if names.len() == 1 && names[0].is_none() {
+        return Some(0);
+    }
+    None
+}
+
+/// Pick the next capture buffer, skipping buffers the host still holds and
+/// buffers with a capture already in flight. `is_busy` covers both.
+fn pick_free_buffer(num_buffers: usize, next: usize, is_busy: impl Fn(usize) -> bool) -> Option<usize> {
+    if num_buffers == 0 {
+        return None;
+    }
+    for i in 0..num_buffers {
+        let candidate = (next + i) % num_buffers;
+        if !is_busy(candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+enum DamagePlan<'a> {
+    Full,
+    Rects(&'a [DamageRect]),
+}
+
+/// Decide how to forward screencopy damage to the host surface.
+///
+/// Unknown damage (no rects) must assume full damage. Too many rects, or
+/// damage covering most of the buffer, is cheaper as one full damage.
+fn coalesce_damage(damage: &[DamageRect], buffer_width: u32, buffer_height: u32) -> DamagePlan<'_> {
+    const MAX_DAMAGE_RECTS: usize = 16;
+    if damage.is_empty() || damage.len() > MAX_DAMAGE_RECTS {
+        return DamagePlan::Full;
+    }
+    let total: u64 = damage.iter().map(|r| r.w.max(0) as u64 * r.h.max(0) as u64).sum();
+    let full = buffer_width as u64 * buffer_height as u64;
+    if full > 0 && total * 4 >= full * 3 {
+        DamagePlan::Full
+    } else {
+        DamagePlan::Rects(damage)
+    }
+}
+
+/// Parse a linux-dmabuf format-table blob: tightly packed 16-byte entries of
+/// u32 fourcc (native endian), 4 bytes padding, u64 modifier (native endian).
+fn parse_format_table(bytes: &[u8]) -> Vec<(u32, u64)> {
+    bytes
+        .chunks_exact(16)
+        .map(|c| {
+            let fourcc = u32::from_ne_bytes(c[0..4].try_into().unwrap());
+            let modifier = u64::from_ne_bytes(c[8..16].try_into().unwrap());
+            (fourcc, modifier)
+        })
+        .collect()
+}
+
+/// Parse a tranche_formats index array: tightly packed u16 indexes (native
+/// endian) into the format table.
+fn parse_tranche_indices(bytes: &[u8]) -> Vec<u16> {
+    bytes.chunks_exact(2).map(|c| u16::from_ne_bytes(c.try_into().unwrap())).collect()
+}
+
+fn read_format_table_fd(fd: std::os::fd::OwnedFd) -> Vec<(u32, u64)> {
+    use std::io::Read;
+    use std::io::Seek;
+    let mut file = std::fs::File::from(fd);
+    // The table fd shares its file offset with the compositor's memfd across
+    // SCM_RIGHTS (same open file description), and any reader leaves it at
+    // EOF. Always rewind first; the spec's mmap approach is immune, read is
+    // not.
+    if file.rewind().is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_ok() {
+        parse_format_table(&bytes)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Modifier value for a linear (untiled) layout.
+const MOD_LINEAR: u64 = 0;
+/// Wildcard modifier: advertised to mean "any layout", never allocatable.
+const MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// Map a negotiated fourcc back to the GBM format used for allocation.
+/// Only Xrgb8888 is considered: the screencopy server hard-requires it for
+/// dmabuf capture buffers and rejects anything else as invalid.
+fn gbm_format_from_fourcc(fourcc: u32) -> Option<Format> {
+    if fourcc == Format::Xrgb8888 as u32 {
+        Some(Format::Xrgb8888)
+    } else {
+        None
+    }
+}
+
+fn fourcc_name(fourcc: u32) -> String {
+    String::from_utf8_lossy(&fourcc.to_le_bytes()).into_owned()
+}
+
+/// Legacy LINEAR allocation, kept as the fallback when feedback negotiation
+/// yields nothing usable.
+fn linear_buffer(gbm_dev: &Device<File>, width: u32, height: u32) -> Result<BufferObject<()>> {
+    gbm_dev
+        .create_buffer_object::<()>(
+            width,
+            height,
+            Format::Xrgb8888,
+            BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR,
+        )
+        .context("error creating GBM buffer object")
+}
+
+/// Pick the (fourcc, modifier) pair for the shared capture buffers.
+///
+/// Only Xrgb8888 pairs common to both sides are eligible. Preference passes,
+/// each walking the target's tranches in compositor order:
+/// 1. a pair from a scanout-flagged tranche (direct scanout / overlay path),
+/// 2. otherwise the first pair with a non-linear modifier (tiled GPU layout),
+/// 3. otherwise the first common pair (may be LINEAR).
+/// The passes exist because renderers commonly list LINEAR first even though
+/// it is the slowest layout; a plain ordered walk would never improve on it.
+fn negotiate_buffer_format(target: &DmabufFeedback, host: &DmabufFeedback) -> Option<(u32, u64)> {
+    if !target.done || !host.done {
+        return None;
+    }
+    let host_pairs: HashSet<(u32, u64)> =
+        host.tranches.iter().flat_map(|t| t.formats.iter().copied()).collect();
+    let eligible = |fourcc: u32, modifier: u64| {
+        modifier != MOD_INVALID
+            && gbm_format_from_fourcc(fourcc).is_some()
+            && host_pairs.contains(&(fourcc, modifier))
+    };
+    for tranche in &target.tranches {
+        if !tranche.scanout {
+            continue;
+        }
+        for (fourcc, modifier) in &tranche.formats {
+            if eligible(*fourcc, *modifier) {
+                return Some((*fourcc, *modifier));
+            }
+        }
+    }
+    for tranche in &target.tranches {
+        for (fourcc, modifier) in &tranche.formats {
+            if *modifier != MOD_LINEAR && eligible(*fourcc, *modifier) {
+                return Some((*fourcc, *modifier));
+            }
+        }
+    }
+    for tranche in &target.tranches {
+        for (fourcc, modifier) in &tranche.formats {
+            if eligible(*fourcc, *modifier) {
+                return Some((*fourcc, *modifier));
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -685,25 +995,50 @@ fn main() -> Result<()> {
 
     let mut target_state = TargetState {
         seat: None,
-        output: None,
+        outputs: Vec::new(),
         output_name: args.output.clone(),
+        selected: None,
         screencopy_manager: None,
         linux_dmabuf: None,
+        dmabuf_feedback: FeedbackCollector::default(),
+        dmabuf_feedback_obj: None,
         virtual_pointer_mgr: None,
         virtual_pointer: None,
         virtual_keyboard_mgr: None,
         virtual_keyboard: None,
         width: 1920,
         height: 1080,
-        ready_to_capture: false,
-        frame_ready: false,
-        frame_failed: false,
-        active_frame_buffer_idx: None,
+        frame_damage: HashMap::new(),
+        completed: Vec::new(),
+        failed: Vec::new(),
     };
 
     let _target_registry = target_conn.display().get_registry(&target_qh, ());
     target_queue.roundtrip(&mut target_state)?;
     target_queue.roundtrip(&mut target_state)?;
+
+    // Request dmabuf feedback (v4+) so allocation can use the compositor's
+    // preferred format/modifier instead of LINEAR.
+    let target_dmabuf_proto = target_state.linux_dmabuf.clone();
+    if let Some(dmabuf) = &target_dmabuf_proto {
+        if dmabuf.version() >= 4 {
+            target_state.dmabuf_feedback_obj = Some(dmabuf.get_default_feedback(&target_qh, ()));
+        }
+    }
+    target_queue.roundtrip(&mut target_state)?;
+
+    let discovered: Vec<Option<String>> = target_state.outputs.iter().map(|o| o.name.clone()).collect();
+    let selected = select_output_index(&discovered, &target_state.output_name).with_context(|| {
+        let names: Vec<String> = discovered.iter().map(|n| n.clone().unwrap_or_else(|| "(unnamed)".to_string())).collect();
+        format!("output '{}' not found on target (discovered: [{}])", target_state.output_name, names.join(", "))
+    })?;
+    {
+        let entry = &target_state.outputs[selected];
+        target_state.width = entry.width;
+        target_state.height = entry.height;
+    }
+    target_state.selected = Some(selected);
+    println!("[nori-view] Selected target output '{}' ({}x{})", target_state.output_name, target_state.width, target_state.height);
 
     if target_state.virtual_keyboard.is_none() {
         if let (Some(mgr), Some(seat)) = (&target_state.virtual_keyboard_mgr, &target_state.seat) {
@@ -723,6 +1058,8 @@ fn main() -> Result<()> {
         compositor: None,
         xdg_wm_base: None,
         linux_dmabuf: None,
+        dmabuf_feedback: FeedbackCollector::default(),
+        dmabuf_feedback_obj: None,
         seat: None,
         inhibit_manager: None,
         inhibitor: None,
@@ -735,8 +1072,8 @@ fn main() -> Result<()> {
         keyboard: None,
         touch: None,
         configured: false,
-        width: (target_state.width as f64 / 1.5).round() as u32,
-        height: (target_state.height as f64 / 1.5).round() as u32,
+        width: target_state.width,
+        height: target_state.height,
         pointer_events: Vec::new(),
         keyboard_events: Vec::new(),
         held_keys: HashSet::new(),
@@ -744,6 +1081,7 @@ fn main() -> Result<()> {
         mod_held: false,
         shift_held: false,
         buffer_busy: Vec::new(),
+        frame_done: true,
         is_fullscreen: false,
         is_focused: true,
         last_unfocused_capture: None,
@@ -752,6 +1090,14 @@ fn main() -> Result<()> {
 
     let _host_registry = host_conn.display().get_registry(&host_qh, ());
     host_queue.roundtrip(&mut host_state)?;
+    host_queue.roundtrip(&mut host_state)?;
+
+    let host_dmabuf_proto = host_state.linux_dmabuf.clone();
+    if let Some(dmabuf) = &host_dmabuf_proto {
+        if dmabuf.version() >= 4 {
+            host_state.dmabuf_feedback_obj = Some(dmabuf.get_default_feedback(&host_qh, ()));
+        }
+    }
     host_queue.roundtrip(&mut host_state)?;
 
     // Setup Host Surface & Toplevel
@@ -802,36 +1148,78 @@ fn main() -> Result<()> {
         target_state.width, target_state.height
     );
 
+    // Negotiate a shared (format, modifier) from both compositors' dmabuf
+    // feedback so buffers use tiled/scanout layouts instead of LINEAR.
+    let target_dmabuf = target_state.linux_dmabuf.as_ref().context("target lacks zwp_linux_dmabuf_v1")?;
+    let host_dmabuf = host_state.linux_dmabuf.as_ref().context("host lacks zwp_linux_dmabuf_v1")?;
+    let negotiated = negotiate_buffer_format(
+        &target_state.dmabuf_feedback.snapshot(),
+        &host_state.dmabuf_feedback.snapshot(),
+    );
+    let mut try_modifiers: Option<(Format, u32, u64)> = None;
+    match negotiated {
+        Some((fourcc, modifier)) => {
+            if let Some(format) = gbm_format_from_fourcc(fourcc) {
+                println!(
+                    "[nori-view] Negotiated dmabuf {} modifier 0x{:016x} ({} target tranches, {} host tranches)",
+                    fourcc_name(fourcc),
+                    modifier,
+                    target_state.dmabuf_feedback.tranches.len(),
+                    host_state.dmabuf_feedback.tranches.len(),
+                );
+                try_modifiers = Some((format, fourcc, modifier));
+            }
+        }
+        None => {
+            println!("[nori-view] No common dmabuf format/modifier in feedback; falling back to LINEAR");
+        }
+    }
+
     // Allocate 4 Zero-Copy DMA-BUF Buffers (Quad Buffering with Host Release Tracking)
     let buffer_width = target_state.width;
     let buffer_height = target_state.height;
-    let target_dmabuf = target_state.linux_dmabuf.as_ref().context("target lacks zwp_linux_dmabuf_v1")?;
-    let host_dmabuf = host_state.linux_dmabuf.as_ref().context("host lacks zwp_linux_dmabuf_v1")?;
 
     let mut buffers: Vec<DmaBuffer> = Vec::new();
     const NUM_BUFFERS: usize = 4;
     host_state.buffer_busy = vec![false; NUM_BUFFERS];
 
+    let mut warned_fallback = false;
     for id in 0..NUM_BUFFERS {
-        let bo = gbm_dev
-            .create_buffer_object::<()>(
-                buffer_width,
-                buffer_height,
-                Format::Xrgb8888,
-                BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR,
-            )
-            .context("error creating GBM buffer object")?;
+        // Try the negotiated tiled modifier first; fall back to LINEAR when
+        // allocation fails so an exotic tranche can never break startup.
+        let (bo, fourcc) = match try_modifiers {
+            Some((format, fourcc, modifier)) => {
+                match gbm_dev.create_buffer_object_with_modifiers2::<()>(
+                    buffer_width,
+                    buffer_height,
+                    format,
+                    std::iter::once(Modifier::from(modifier)),
+                    BufferObjectFlags::RENDERING | BufferObjectFlags::SCANOUT,
+                ) {
+                    Ok(bo) => (bo, fourcc),
+                    Err(err) => {
+                        if !warned_fallback {
+                            println!("[nori-view] Modifier allocation failed ({err:#}); falling back to LINEAR");
+                            warned_fallback = true;
+                        }
+                        (linear_buffer(&gbm_dev, buffer_width, buffer_height)?, Format::Xrgb8888 as u32)
+                    }
+                }
+            }
+            None => (linear_buffer(&gbm_dev, buffer_width, buffer_height)?, Format::Xrgb8888 as u32),
+        };
 
-        let prime_fd = bo.fd().context("error exporting BO fd")?;
-        let stride = bo.stride();
         let modifier = u64::from(bo.modifier());
         let modifier_hi = (modifier >> 32) as u32;
         let modifier_lo = (modifier & 0xFFFFFFFF) as u32;
-        let fourcc = Format::Xrgb8888 as u32;
+        let plane_count = bo.plane_count();
 
-        // Target buffer
+        // Target buffer (one fresh prime fd per plane)
         let target_params = target_dmabuf.create_params(&target_qh, id);
-        target_params.add(prime_fd.as_fd(), 0, 0, stride, modifier_hi, modifier_lo);
+        for plane in 0..plane_count {
+            let fd = bo.fd_for_plane(plane as i32).map_err(|e| anyhow::anyhow!("error exporting BO plane fd: {e:?}"))?;
+            target_params.add(fd.as_fd(), plane, bo.offset(plane as i32), bo.stride_for_plane(plane as i32), modifier_hi, modifier_lo);
+        }
         let target_wl_buf = target_params.create_immed(
             buffer_width as i32,
             buffer_height as i32,
@@ -841,11 +1229,12 @@ fn main() -> Result<()> {
             id,
         );
 
-        // Host buffer (dup the fd so each compositor owns its descriptor)
-        let dup_fd = nix::unistd::dup(&prime_fd)
-            .context("error duplicating prime fd")?;
+        // Host buffer (fresh fds again so each compositor owns its descriptors)
         let host_params = host_dmabuf.create_params(&host_qh, id);
-        host_params.add(dup_fd.as_fd(), 0, 0, stride, modifier_hi, modifier_lo);
+        for plane in 0..plane_count {
+            let fd = bo.fd_for_plane(plane as i32).map_err(|e| anyhow::anyhow!("error exporting BO plane fd: {e:?}"))?;
+            host_params.add(fd.as_fd(), plane, bo.offset(plane as i32), bo.stride_for_plane(plane as i32), modifier_hi, modifier_lo);
+        }
         let host_wl_buf = host_params.create_immed(
             buffer_width as i32,
             buffer_height as i32,
@@ -856,7 +1245,6 @@ fn main() -> Result<()> {
         );
 
         buffers.push(DmaBuffer {
-            id,
             _bo: bo,
             target_buffer: target_wl_buf,
             host_buffer: host_wl_buf,
@@ -872,11 +1260,13 @@ fn main() -> Result<()> {
     );
 
     let screencopy_mgr = target_state.screencopy_manager.clone().context("target lacks zwlr_screencopy_manager_v1")?;
-    let target_output = target_state.output.clone().context("target lacks output")?;
+    let selected_idx = target_state.selected.context("no target output selected")?;
+    let target_output = target_state.outputs[selected_idx].output.clone();
     let virtual_pointer = target_state.virtual_pointer.clone();
     let virtual_keyboard = target_state.virtual_keyboard.clone();
 
-    let mut current_frame: Option<ZwlrScreencopyFrameV1> = None;
+    const MAX_IN_FLIGHT: usize = 2;
+    let mut in_flight: HashMap<usize, ZwlrScreencopyFrameV1> = HashMap::new();
     let mut next_buffer_idx = 0;
 
     // Zero-Copy Streaming Loop
@@ -936,22 +1326,19 @@ fn main() -> Result<()> {
             }
         };
 
-        if should_capture && current_frame.is_none() {
-            let mut free_idx = None;
-            for i in 0..buffers.len() {
-                let candidate = (next_buffer_idx + i) % buffers.len();
-                if !host_state.buffer_busy[candidate] {
-                    free_idx = Some(candidate);
-                    break;
-                }
-            }
+        // Pace captures on the host frame callback so we never render frames
+        // the host compositor is not ready to consume.
+        if should_capture && host_state.frame_done && in_flight.len() < MAX_IN_FLIGHT {
+            let free_idx = pick_free_buffer(buffers.len(), next_buffer_idx, |idx| {
+                host_state.buffer_busy[idx] || in_flight.contains_key(&idx)
+            });
 
             if let Some(buf_idx) = free_idx {
                 next_buffer_idx = (buf_idx + 1) % buffers.len();
                 let target_buf = &buffers[buf_idx].target_buffer;
                 let frame = screencopy_mgr.capture_output(0, &target_output, &target_qh, buf_idx);
                 frame.copy_with_damage(target_buf);
-                current_frame = Some(frame);
+                in_flight.insert(buf_idx, frame);
                 target_conn.flush()?;
                 if !host_state.is_focused {
                     host_state.last_unfocused_capture = Some(now);
@@ -988,28 +1375,228 @@ fn main() -> Result<()> {
         // Dispatch target events (e.g. screencopy frame ready)
         target_queue.dispatch_pending(&mut target_state)?;
 
-        if target_state.frame_ready {
-            target_state.frame_ready = false;
-            current_frame = None;
+        let failures: Vec<usize> = target_state.failed.drain(..).collect();
+        for failed_idx in &failures {
+            in_flight.remove(failed_idx);
+        }
 
-            if let Some(buf_idx) = target_state.active_frame_buffer_idx.take() {
-                let host_buf = &buffers[buf_idx].host_buffer;
-                host_surface.attach(Some(host_buf), 0, 0);
-                if let Some(vp) = &host_state.viewport {
-                    vp.set_destination(host_state.width as i32, host_state.height as i32);
+        let completions: Vec<(usize, Vec<DamageRect>)> = target_state.completed.drain(..).collect();
+        for (buf_idx, damage) in &completions {
+            in_flight.remove(buf_idx);
+            let host_buf = &buffers[*buf_idx].host_buffer;
+            host_surface.attach(Some(host_buf), 0, 0);
+            // Viewport destination persists; it is only updated on host
+            // configure (resize), never per frame.
+            match coalesce_damage(damage, buffer_width, buffer_height) {
+                DamagePlan::Full => {
+                    host_surface.damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
                 }
-                host_surface.damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
-                host_surface.commit();
-                host_state.buffer_busy[buf_idx] = true;
-                host_conn.flush()?;
+                DamagePlan::Rects(rects) => {
+                    for rect in rects {
+                        host_surface.damage_buffer(rect.x, rect.y, rect.w, rect.h);
+                    }
+                }
             }
-        } else if target_state.frame_failed {
-            target_state.frame_failed = false;
-            current_frame = None;
+            host_surface.frame(&host_qh, ());
+            host_surface.commit();
+            host_state.buffer_busy[*buf_idx] = true;
+            host_state.frame_done = false;
+            host_conn.flush()?;
+        }
+
+        if !failures.is_empty() && completions.is_empty() {
             std::thread::sleep(Duration::from_millis(16));
         }
     }
 
     println!("[nori-view] Shutting down Zero-Copy DMA-BUF Bridge");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<Option<String>> {
+        list.iter().map(|s| Some(s.to_string())).collect()
+    }
+
+    #[test]
+    fn select_output_prefers_exact_match() {
+        let list = names(&["headless-1", "headless-2"]);
+        assert_eq!(select_output_index(&list, "headless-2"), Some(1));
+        assert_eq!(select_output_index(&list, "headless-1"), Some(0));
+    }
+
+    #[test]
+    fn select_output_rejects_unknown_on_multi_output_slot() {
+        let list = names(&["headless-1", "headless-2"]);
+        assert_eq!(select_output_index(&list, "headless-3"), None);
+        assert_eq!(select_output_index(&list, ""), None);
+    }
+
+    #[test]
+    fn select_output_falls_back_to_lone_unnamed_output() {
+        assert_eq!(select_output_index(&[None], "headless-1"), Some(0));
+    }
+
+    #[test]
+    fn select_output_rejects_mismatch_on_named_single_output() {
+        let list = names(&["headless-1"]);
+        assert_eq!(select_output_index(&list, "headless-2"), None);
+        assert_eq!(select_output_index(&[], "headless-1"), None);
+    }
+
+    #[test]
+    fn pick_free_buffer_rotates_and_skips_busy() {
+        let busy = [false, true, false, true];
+        let in_flight: HashSet<usize> = [2].into_iter().collect();
+        // next=0 -> 0 is free.
+        assert_eq!(pick_free_buffer(4, 0, |i| busy[i] || in_flight.contains(&i)), Some(0));
+        // next=1 -> 1 host-busy, 2 in-flight, 3 host-busy, wraps to 0.
+        assert_eq!(pick_free_buffer(4, 1, |i| busy[i] || in_flight.contains(&i)), Some(0));
+    }
+
+    #[test]
+    fn pick_free_buffer_returns_none_when_all_busy() {
+        let busy = [true, true];
+        let in_flight: HashSet<usize> = HashSet::new();
+        assert_eq!(pick_free_buffer(2, 0, |i| busy[i] || in_flight.contains(&i)), None);
+        assert_eq!(pick_free_buffer(0, 0, |_| false), None);
+    }
+
+    #[test]
+    fn coalesce_damage_forwards_small_rects() {
+        let damage = vec![
+            DamageRect { x: 0, y: 0, w: 100, h: 100 },
+            DamageRect { x: 500, y: 500, w: 64, h: 64 },
+        ];
+        match coalesce_damage(&damage, 1920, 1200) {
+            DamagePlan::Rects(rects) => assert_eq!(rects.len(), 2),
+            DamagePlan::Full => panic!("small damage should forward rects"),
+        }
+    }
+
+    #[test]
+    fn coalesce_damage_assumes_full_on_unknown_damage() {
+        match coalesce_damage(&[], 1920, 1200) {
+            DamagePlan::Full => (),
+            DamagePlan::Rects(_) => panic!("empty damage must assume full"),
+        }
+    }
+
+    #[test]
+    fn coalesce_damage_collapses_large_or_many_rects() {
+        let full = vec![DamageRect { x: 0, y: 0, w: 1920, h: 1200 }];
+        assert!(matches!(coalesce_damage(&full, 1920, 1200), DamagePlan::Full));
+
+        let many: Vec<DamageRect> = (0..17).map(|i| DamageRect { x: i * 10, y: 0, w: 4, h: 4 }).collect();
+        assert!(matches!(coalesce_damage(&many, 1920, 1200), DamagePlan::Full));
+    }
+
+    fn table_bytes(entries: &[(u32, u64)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (fourcc, modifier) in entries {
+            bytes.extend_from_slice(&fourcc.to_ne_bytes());
+            bytes.extend_from_slice(&[0u8; 4]);
+            bytes.extend_from_slice(&modifier.to_ne_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn parse_format_table_reads_entries_and_skips_padding() {
+        let bytes = table_bytes(&[(0x34325258, 0), (0x34325241, 0x0100000000000001)]);
+        assert_eq!(
+            parse_format_table(&bytes),
+            vec![(0x34325258, 0), (0x34325241, 0x0100000000000001)]
+        );
+        assert!(parse_format_table(&[]).is_empty());
+        assert!(parse_format_table(&[1u8; 15]).is_empty());
+    }
+
+    #[test]
+    fn parse_tranche_indices_reads_u16_list() {
+        assert_eq!(parse_tranche_indices(&[0u8, 0, 3, 0, 44, 2]), vec![0, 3, 556]);
+        assert!(parse_tranche_indices(&[]).is_empty());
+    }
+
+    fn feedback(pairs: &[Vec<(u32, u64)>]) -> DmabufFeedback {
+        DmabufFeedback {
+            tranches: pairs
+                .iter()
+                .map(|formats| FeedbackTranche { scanout: false, formats: formats.clone() })
+                .collect(),
+            done: true,
+        }
+    }
+
+    #[test]
+    fn negotiate_prefers_scanout_then_tiled_over_linear() {
+        let xrgb = Format::Xrgb8888 as u32;
+        let host = feedback(&[vec![(xrgb, 0), (xrgb, 9), (xrgb, 3)]]);
+        // LINEAR listed first still loses to a tiled modifier.
+        let target = feedback(&[vec![(xrgb, 0), (xrgb, 9)]]);
+        assert_eq!(negotiate_buffer_format(&target, &host), Some((xrgb, 9)));
+        // A scanout tranche wins even when ordered later.
+        let target_scanout = DmabufFeedback {
+            tranches: vec![
+                FeedbackTranche { scanout: false, formats: vec![(xrgb, 9)] },
+                FeedbackTranche { scanout: true, formats: vec![(xrgb, 3)] },
+            ],
+            done: true,
+        };
+        assert_eq!(negotiate_buffer_format(&target_scanout, &host), Some((xrgb, 3)));
+        // LINEAR is the last resort, not a failure.
+        let target_linear = feedback(&[vec![(xrgb, 0)]]);
+        let host_linear = feedback(&[vec![(xrgb, 0)]]);
+        assert_eq!(negotiate_buffer_format(&target_linear, &host_linear), Some((xrgb, 0)));
+    }
+
+    #[test]
+    fn negotiate_skips_unallocatable_and_host_missing_pairs() {
+        let xrgb = Format::Xrgb8888 as u32;
+        let argb = Format::Argb8888 as u32;
+        // ARGB8888 is not allocatable: the screencopy server requires XRGB8888.
+        let target = feedback(&[vec![(argb, 1), (xrgb, 5)]]);
+        let host = feedback(&[vec![(argb, 1)]]);
+        assert_eq!(negotiate_buffer_format(&target, &host), None);
+
+        let host2 = feedback(&[vec![(xrgb, 5)]]);
+        assert_eq!(negotiate_buffer_format(&target, &host2), Some((xrgb, 5)));
+    }
+
+    #[test]
+    fn negotiate_skips_invalid_wildcard_modifier() {
+        let xrgb = Format::Xrgb8888 as u32;
+        let target = feedback(&[vec![(xrgb, MOD_INVALID)]]);
+        let host = feedback(&[vec![(xrgb, MOD_INVALID), (xrgb, 0)]]);
+        assert_eq!(negotiate_buffer_format(&target, &host), None);
+    }
+
+    #[test]
+    fn negotiate_requires_finished_feedback_on_both_sides() {
+        let xrgb = Format::Xrgb8888 as u32;
+        let done = feedback(&[vec![(xrgb, 0)]]);
+        let pending = DmabufFeedback { tranches: done.tranches.clone(), done: false };
+        assert_eq!(negotiate_buffer_format(&done, &done), Some((xrgb, 0)));
+        assert_eq!(negotiate_buffer_format(&pending, &done), None);
+        assert_eq!(negotiate_buffer_format(&done, &pending), None);
+    }
+
+    #[test]
+    fn collector_assembles_tranches_from_events() {
+        let mut collector = FeedbackCollector::default();
+        collector.push_table(vec![(0x34325258, 0), (0x34325258, 8)]);
+        collector.push_tranche_flags(true);
+        collector.push_tranche_formats(&[1, 0, 9]);
+        collector.end_tranche();
+        collector.finish();
+        let snapshot = collector.snapshot();
+        assert!(snapshot.done);
+        assert_eq!(snapshot.tranches.len(), 1);
+        assert!(snapshot.tranches[0].scanout);
+        // Out-of-range index 9 is dropped.
+        assert_eq!(snapshot.tranches[0].formats, vec![(0x34325258, 8), (0x34325258, 0)]);
+    }
 }
