@@ -2346,6 +2346,7 @@ dependencies = [
  "drm",
  "gbm",
  "nix",
+ "serde_json",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-misc",

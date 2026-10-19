@@ -435,6 +435,28 @@ impl Headless {
 
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
+        // Animation pump: headless has no VBlank source to sustain animation
+        // frames (compare tty's re-queue on VBlank), so re-arm a frame timer
+        // while animations remain. A pending redraw re-evaluates this on its
+        // own pass. Unviewed outputs never reach here (standby handles their
+        // redraws), so detached slots stay idle through animations.
+        if output_state.unfinished_animations_remain
+            && matches!(output_state.redraw_state, RedrawState::Idle)
+        {
+            let timer = Timer::from_duration(Duration::from_millis(1000 / active_fps.max(1)));
+            let output_clone = output.clone();
+            let token = niri
+                .event_loop
+                .insert_source(timer, move |_, _, data| {
+                    data.niri.queue_redraw(&output_clone);
+                    TimeoutAction::Drop
+                })
+                .ok();
+            if let Some(token) = token {
+                output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+            }
+        }
+
         RenderResult::Submitted
     }
 

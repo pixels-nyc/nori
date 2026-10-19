@@ -338,6 +338,13 @@ impl WaylandDndGrabHandler for State {
         serial: Serial,
         type_: dnd::GrabType,
     ) {
+        // Export hook: notify the viewer and copy payloads while the source is
+        // alive, before it moves into the grab.
+        self.niri.nori_dnd.note_drag_started(
+            &source,
+            matches!(type_, dnd::GrabType::Touch),
+        );
+
         self.niri.dnd_icon = icon.map(|surface| DndIcon {
             surface,
             offset: Point::new(0, 0),
@@ -376,7 +383,8 @@ impl DndGrabHandler for State {
         trace!("dnd dropped, target: {target:?}, validated: {validated}");
 
         // End DnD before activating a specific window below so that it takes precedence.
-        self.niri.on_maybe_dnd_ended();
+        self.niri
+            .on_maybe_dnd_ended(crate::protocols::nori_dnd::DragEndReason::Dropped);
 
         // Activate the target output, since that's how Firefox drag-tab-into-new-window works for
         // example. On successful drop, additionally activate the target window.
@@ -403,14 +411,16 @@ impl DndGrabHandler for State {
     fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
         trace!("dnd cancelled");
 
-        self.niri.on_maybe_dnd_ended();
+        self.niri
+            .on_maybe_dnd_ended(crate::protocols::nori_dnd::DragEndReason::Cancelled);
     }
 }
 
 impl crate::niri::Niri {
-    fn on_maybe_dnd_ended(&mut self) {
+    fn on_maybe_dnd_ended(&mut self, reason: crate::protocols::nori_dnd::DragEndReason) {
         self.layout.dnd_end();
         self.dnd_icon = None;
+        self.nori_dnd.note_drag_ended(reason);
         // FIXME: more granular
         self.queue_redraw_all();
     }
@@ -643,12 +653,14 @@ impl ScreencopyHandler for State {
         // otherwise render it immediately.
         if screencopy.with_damage() {
             let output = screencopy.output().clone();
-            self.niri.screencopy_state.push(manager, screencopy);
-            // Wake the output so the queued capture renders promptly instead
-            // of waiting for the next client-driven or timer-driven redraw.
-            // This matters most for headless slots, whose frame clock idles
-            // at standby rate when no viewer is attached yet.
-            self.niri.queue_redraw(&output);
+            let queue_was_empty = self.niri.screencopy_state.push(manager, screencopy);
+            // Wake only on an empty-to-nonempty transition so the first frame
+            // renders promptly; backlogged frames complete on commit- and
+            // animation-driven redraws. Waking per arrival would pump full
+            // redraws at request rate even for static content.
+            if queue_was_empty {
+                self.niri.queue_redraw(&output);
+            }
         } else {
             self.backend.with_primary_renderer(|renderer| {
                 if let Err(err) = self

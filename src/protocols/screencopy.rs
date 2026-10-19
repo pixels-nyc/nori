@@ -234,15 +234,26 @@ impl ScreencopyManagerState {
         }
     }
 
-    pub fn push(&mut self, manager: &ZwlrScreencopyManagerV1, screencopy: Screencopy) {
+    /// Pushes a frame, returning true when the queue was empty.
+    ///
+    /// Callers wake the output only on an empty-to-nonempty transition:
+    /// backlogged frames complete on commit- and animation-driven redraws,
+    /// so waking per arrival would pump full redraws at request rate even
+    /// for static content.
+    pub fn push(&mut self, manager: &ZwlrScreencopyManagerV1, screencopy: Screencopy) -> bool {
         let Some(queue) = self.queues.get_mut(manager) else {
             // Destroying the manager does not invalidate existing frames, so the queue should
             // keep existing.
             error!("screencopy queue must not be deleted as long as frames exist");
-            return;
+            return false;
         };
 
+        // NOTE: check only the queued backlog, not is_empty(): the frame
+        // being pushed is still registered in pending_frames until copy()
+        // returns after us, so is_empty() would never be true here.
+        let was_empty = queue.screencopies.is_empty();
         queue.push(screencopy);
+        was_empty
     }
 
     pub fn damage_tracker(
