@@ -157,7 +157,9 @@ use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
-use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
+use crate::protocols::screencopy::{
+    Screencopy, ScreencopyBuffer, ScreencopyManagerState, capture_covers_full_output,
+};
 use crate::protocols::virtual_keyboard::VirtualKeyboardManagerState;
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
@@ -5558,6 +5560,17 @@ impl Niri {
 
                         screencopy.damage(damages);
 
+                        // Headless outputs never run a backend scanout render, so refresh
+                        // primary-scanout outputs from capture renders. Otherwise clients
+                        // stay on the ~1 Hz fallback frame-callback throttle and captures
+                        // stall even with a viewer attached.
+                        let primary_states = states.clone();
+                        let full_output_capture = capture_covers_full_output(
+                            screencopy.region_loc(),
+                            screencopy.buffer_size(),
+                            output,
+                        );
+
                         let render_result = Self::render_for_screencopy_internal(
                             renderer,
                             damage_tracker,
@@ -5567,6 +5580,9 @@ impl Niri {
                         );
                         match render_result {
                             Ok(sync) => {
+                                if full_output_capture {
+                                    self.update_primary_scanout_output(output, &primary_states);
+                                }
                                 queue.pop().submit_after_sync(false, sync, &self.event_loop);
                             }
                             Err(err) => {
@@ -5622,6 +5638,13 @@ impl Niri {
 
         let (_damages, states) =
             Self::damage_screencopy_internal(output, &elements, damage_tracker, &screencopy);
+        let primary_states = states.clone();
+        let output_owned = output.clone();
+        let full_output_capture = capture_covers_full_output(
+            screencopy.region_loc(),
+            screencopy.buffer_size(),
+            output,
+        );
         let res = Self::render_for_screencopy_internal(
             renderer,
             damage_tracker,
@@ -5634,6 +5657,12 @@ impl Niri {
         if res.is_err() {
             // Recreate damage tracker to report full damage next check.
             *damage_tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
+        }
+
+        // See render_for_screencopy_with_damage: headless outputs need capture
+        // renders to refresh primary-scanout outputs for full-rate clients.
+        if res.is_ok() && full_output_capture {
+            self.update_primary_scanout_output(&output_owned, &primary_states);
         }
 
         res
@@ -5733,6 +5762,11 @@ impl Niri {
                 continue;
             };
 
+            // Image-copy captures always cover the full output. Refresh
+            // primary-scanout outputs like the screencopy paths so headless
+            // clients get full-rate frame callbacks while captured.
+            let primary_states = states.clone();
+
             let res = match capture_buffer {
                 CaptureBuffer::Dma(dmabuf) => {
                     render_to_dmabuf(renderer, &mut s.damage_tracker, dmabuf, elements, states)
@@ -5751,6 +5785,7 @@ impl Niri {
 
             match res {
                 Ok(sync) => {
+                    self.update_primary_scanout_output(output, &primary_states);
                     image_copy_capture_impl::frame_success_after_sync(
                         frame,
                         transform,

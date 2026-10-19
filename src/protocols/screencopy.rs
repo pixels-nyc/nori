@@ -726,3 +726,94 @@ impl Screencopy {
         }
     }
 }
+
+/// Whether a capture covers the entire output rather than a region.
+///
+/// Callers use this to decide if a capture render may refresh
+/// primary-scanout outputs: partial captures must not, since surfaces outside
+/// the region would read as unpresented and lose their primary.
+pub fn capture_covers_full_output(
+    region_loc: Point<i32, Physical>,
+    buffer_size: Size<i32, Physical>,
+    output: &Output,
+) -> bool {
+    let full_loc = region_loc == Point::from((0, 0));
+    let full_size = output
+        .current_mode()
+        .map(|mode| mode.size == buffer_size)
+        .unwrap_or(false);
+    full_loc && full_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::output::{Mode, PhysicalProperties, Subpixel};
+
+    fn test_output(w: i32, h: i32) -> Output {
+        let output = Output::new(
+            "headless-1".to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "test".to_string(),
+                model: "test".to_string(),
+                serial_number: "1".to_string(),
+            },
+        );
+        output.change_current_state(
+            Some(Mode {
+                size: (w, h).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+        output
+    }
+
+    #[test]
+    fn full_output_capture_covers() {
+        let output = test_output(1920, 1200);
+        assert!(capture_covers_full_output(
+            Point::from((0, 0)),
+            Size::from((1920, 1200)),
+            &output,
+        ));
+    }
+
+    #[test]
+    fn region_capture_does_not_cover() {
+        let output = test_output(1920, 1200);
+        assert!(!capture_covers_full_output(
+            Point::from((100, 100)),
+            Size::from((1920, 1200)),
+            &output,
+        ));
+        assert!(!capture_covers_full_output(
+            Point::from((0, 0)),
+            Size::from((800, 600)),
+            &output,
+        ));
+    }
+
+    #[test]
+    fn capture_without_output_mode_does_not_cover() {
+        let output = Output::new(
+            "headless-1".to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "test".to_string(),
+                model: "test".to_string(),
+                serial_number: "1".to_string(),
+            },
+        );
+        assert!(!capture_covers_full_output(
+            Point::from((0, 0)),
+            Size::from((1920, 1200)),
+            &output,
+        ));
+    }
+}
