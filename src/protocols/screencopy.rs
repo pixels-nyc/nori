@@ -287,6 +287,22 @@ impl ScreencopyManagerState {
     pub fn has_active_cast(&self) -> bool {
         self.queues.values().any(|queue| queue.is_casting())
     }
+
+    /// Whether any client is actively capturing `output`.
+    ///
+    /// This stays true through the grace window after a client's last frame
+    /// (while its cast deadline stands), so brief reattach flicker does not
+    /// flap an output between active and standby.
+    pub fn has_active_cast_for_output(&self, output: &Output) -> bool {
+        self.queues.values().any(|queue| {
+            queue.is_casting()
+                && queue
+                    .cast()
+                    .and_then(|cast| cast.output.upgrade())
+                    .as_ref()
+                    == Some(output)
+        })
+    }
 }
 
 impl<D> GlobalDispatch2<ZwlrScreencopyManagerV1, D> for ScreencopyManagerGlobalData

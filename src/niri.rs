@@ -4837,12 +4837,22 @@ impl Niri {
         let _span = tracy_client::span!("Niri::redraw");
 
         // Verify our invariant.
-        let state = self.output_state.get_mut(output).unwrap();
-        assert!(matches!(
-            state.redraw_state,
-            RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
-        ));
+        {
+            let state = self.output_state.get_mut(output).unwrap();
+            assert!(matches!(
+                state.redraw_state,
+                RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+            ));
+        }
 
+        // Headless standby: outputs without presentation demand drain cheaply
+        // instead of running a full scene pass per commit. Non-headless
+        // backends and demanded outputs always take the full path below.
+        if backend.try_standby_redraw(self, output) {
+            return;
+        }
+
+        let state = self.output_state.get_mut(output).unwrap();
         let target_presentation_time = state.frame_clock.next_presentation_time();
 
         // Freeze the clock at the target time.

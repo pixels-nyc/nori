@@ -109,6 +109,17 @@ impl Backend {
         }
     }
 
+    /// Runs a headless standby drain instead of a full redraw when possible.
+    ///
+    /// Returns true when the redraw was handled; non-headless backends and
+    /// outputs with capture demand always return false.
+    pub fn try_standby_redraw(&mut self, niri: &mut Niri, output: &Output) -> bool {
+        match self {
+            Backend::Headless(headless) => headless.try_standby_redraw(niri, output),
+            Backend::Tty(_) | Backend::Winit(_) => false,
+        }
+    }
+
     pub fn mod_key(&self, config: &Config) -> ModKey {
         match self {
             Backend::Winit(_) => config.input.mod_key_nested.unwrap_or({
