@@ -1,3 +1,6 @@
+use std::fmt;
+use std::str::FromStr;
+
 use knuffel::errors::DecodeError;
 use niri_ipc::{ColumnDisplay, SizeChange};
 
