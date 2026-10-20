@@ -1738,6 +1738,11 @@ impl State {
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
+            Action::ShiftViewOffset(delta) => {
+                self.niri.layout.shift_view_offset(delta.0);
+                // FIXME: granular
+                self.niri.queue_redraw_all();
+            }
             Action::CenterWindow => {
                 self.niri.layout.center_window(None);
                 // FIXME: granular
