@@ -14,7 +14,7 @@ use smithay::input::keyboard::xkb::{keysym_from_name, KEYSYM_CASE_INSENSITIVE, K
 use smithay::input::keyboard::Keysym;
 
 use crate::recent_windows::{MruDirection, MruFilter, MruScope};
-use crate::utils::{expect_only_children, MergeWith};
+use crate::utils::{expect_only_children, FloatOrInt, MergeWith};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Binds(pub Vec<Bind>);
@@ -397,6 +397,7 @@ pub enum Action {
     // Doesn't look like knuffel allows gating on #[cfg(test)]...
     #[knuffel(skip)]
     TestAction,
+    ShiftViewOffset(#[knuffel(argument)] FloatOrInt<-65535, 65535>),
 }
 
 impl From<niri_ipc::Action> for Action {
@@ -708,6 +709,7 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::SetWindowUrgent { id } => Self::SetWindowUrgent(id),
             niri_ipc::Action::UnsetWindowUrgent { id } => Self::UnsetWindowUrgent(id),
             niri_ipc::Action::LoadConfigFile { path } => Self::LoadConfigFile(path),
+            niri_ipc::Action::ShiftViewOffset { delta } => Self::ShiftViewOffset(FloatOrInt(delta)),
         }
     }
 }
@@ -1112,5 +1114,32 @@ mod tests {
                 modifiers: Modifiers::ISO_LEVEL5_SHIFT
             },
         );
+    }
+
+    #[test]
+    fn parse_shift_view_offset() {
+        let config =
+            crate::Config::parse_mem("binds { Mod+Shift+N { shift-view-offset 52; }; }").unwrap();
+        assert_eq!(config.binds.0.len(), 1);
+        assert_eq!(
+            config.binds.0[0].action,
+            Action::ShiftViewOffset(FloatOrInt(52.)),
+        );
+    }
+
+    #[test]
+    fn parse_shift_view_offset_decimal() {
+        let config =
+            crate::Config::parse_mem("binds { Mod+Shift+N { shift-view-offset 52.5; }; }").unwrap();
+        assert_eq!(
+            config.binds.0[0].action,
+            Action::ShiftViewOffset(FloatOrInt(52.5)),
+        );
+    }
+
+    #[test]
+    fn ipc_shift_view_offset_maps_to_config_action() {
+        let ipc = niri_ipc::Action::ShiftViewOffset { delta: 52. };
+        assert_eq!(Action::from(ipc), Action::ShiftViewOffset(FloatOrInt(52.)));
     }
 }

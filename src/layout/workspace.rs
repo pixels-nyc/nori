@@ -1191,6 +1191,12 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    pub fn shift_view_offset(&mut self, delta: f64) {
+        if !self.floating_is_active.get() {
+            self.scrolling.shift_view_offset(delta);
+        }
+    }
+
     pub fn center_window(&mut self, id: Option<&W::Id>) {
         if id.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)

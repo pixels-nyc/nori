@@ -88,7 +88,7 @@ pub mod tile;
 pub mod workspace;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Size changes up to this many pixels don't animate.
 pub const RESIZE_ANIMATION_THRESHOLD: f64 = 10.;
@@ -2293,6 +2293,13 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.center_column();
+    }
+
+    pub fn shift_view_offset(&mut self, delta: f64) {
+        let Some(workspace) = self.active_workspace_mut() else {
+            return;
+        };
+        workspace.shift_view_offset(delta);
     }
 
     pub fn center_window(&mut self, id: Option<&W::Id>) {

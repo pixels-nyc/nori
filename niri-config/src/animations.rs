@@ -266,6 +266,22 @@ impl Default for HorizontalViewMovementAnim {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrutNudgeAnimation(pub Animation);
+
+impl Default for StrutNudgeAnimation {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: Kind::Spring(SpringParams {
+                damping_ratio: 0.88,
+                stiffness: 800,
+                epsilon: 0.001,
+            }),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowMovementAnim(pub Animation);
 
 impl Default for WindowMovementAnim {
@@ -398,6 +414,21 @@ where
 }
 
 impl<S> knuffel::Decode<S> for HorizontalViewMovementAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for StrutNudgeAnimation
 where
     S: knuffel::traits::ErrorSpan,
 {

@@ -4,11 +4,44 @@ use std::str::FromStr;
 use knuffel::errors::DecodeError;
 use niri_ipc::{ColumnDisplay, SizeChange};
 
+use crate::animations::StrutNudgeAnimation;
 use crate::appearance::{
     Border, FocusRing, InsertHint, Shadow, TabIndicator, DEFAULT_BACKGROUND_COLOR,
 };
 use crate::utils::{expect_only_children, Flag, MergeWith};
 use crate::{BorderRule, Color, FloatOrInt, InsertHintPart, ShadowRule, TabIndicatorPart};
+
+/// How the ribbon responds to struts (layer-shell panels and config struts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StrutBehavior {
+    /// Keep column widths; slide the ribbon under the strut (nori default).
+    #[default]
+    NudgeRibbon,
+    /// Upstream behavior: shrink columns to fit the strut-free area.
+    SquashColumns,
+}
+
+impl FromStr for StrutBehavior {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "nudge-ribbon" => Ok(Self::NudgeRibbon),
+            "squash-columns" => Ok(Self::SquashColumns),
+            _ => Err("invalid strut behavior, can be \"nudge-ribbon\" or \"squash-columns\""),
+        }
+    }
+}
+
+impl fmt::Display for StrutBehavior {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::NudgeRibbon => "nudge-ribbon",
+            Self::SquashColumns => "squash-columns",
+        };
+        f.write_str(s)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
@@ -27,6 +60,8 @@ pub struct Layout {
     pub gaps: f64,
     pub struts: Struts,
     pub background_color: Color,
+    pub strut_behavior: StrutBehavior,
+    pub strut_nudge_animation: StrutNudgeAnimation,
 }
 
 impl Default for Layout {
@@ -55,6 +90,8 @@ impl Default for Layout {
                 PresetSize::Proportion(2. / 3.),
             ],
             background_color: DEFAULT_BACKGROUND_COLOR,
+            strut_behavior: StrutBehavior::default(),
+            strut_nudge_animation: StrutNudgeAnimation::default(),
         }
     }
 }
@@ -81,6 +118,8 @@ impl MergeWith<LayoutPart> for Layout {
             default_column_display,
             struts,
             background_color,
+            strut_behavior,
+            strut_nudge_animation,
         );
 
         if let Some(x) = part.default_column_width {
@@ -129,6 +168,10 @@ pub struct LayoutPart {
     pub struts: Option<Struts>,
     #[knuffel(child)]
     pub background_color: Option<Color>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub strut_behavior: Option<StrutBehavior>,
+    #[knuffel(child)]
+    pub strut_nudge_animation: Option<StrutNudgeAnimation>,
 }
 
 #[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
@@ -197,5 +240,46 @@ where
         } else {
             Ok(Self(None))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strut_behavior_from_str() {
+        assert_eq!(
+            "nudge-ribbon".parse::<StrutBehavior>().unwrap(),
+            StrutBehavior::NudgeRibbon
+        );
+        assert_eq!(
+            "squash-columns".parse::<StrutBehavior>().unwrap(),
+            StrutBehavior::SquashColumns
+        );
+        assert_eq!(StrutBehavior::default(), StrutBehavior::NudgeRibbon);
+        assert!("shrink".parse::<StrutBehavior>().is_err());
+        assert_eq!(StrutBehavior::NudgeRibbon.to_string(), "nudge-ribbon");
+    }
+
+    #[track_caller]
+    fn do_parse(text: &str) -> Layout {
+        let part = knuffel::parse::<LayoutPart>("test.kdl", text)
+            .map_err(miette::Report::new)
+            .unwrap();
+        Layout::from_part(&part)
+    }
+
+    #[test]
+    fn parse_strut_behavior() {
+        let layout = do_parse(r#"strut-behavior "squash-columns""#);
+        assert_eq!(layout.strut_behavior, StrutBehavior::SquashColumns);
+
+        let layout = do_parse(r#"strut-behavior "nudge-ribbon""#);
+        assert_eq!(layout.strut_behavior, StrutBehavior::NudgeRibbon);
+
+        // Absent node keeps the default.
+        let layout = do_parse("gaps 8");
+        assert_eq!(layout.strut_behavior, StrutBehavior::NudgeRibbon);
     }
 }

@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use niri_config::utils::MergeWith as _;
-use niri_config::{CenterFocusedColumn, PresetSize, Struts};
+use niri_config::{CenterFocusedColumn, PresetSize, StrutBehavior, Struts};
 use niri_ipc::{ColumnDisplay, SizeChange, WindowLayout};
 use ordered_float::NotNan;
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -361,6 +361,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.options = options;
 
         // Apply always-center and such right away.
+        //
+        // This refit already follows the working area when struts appear or
+        // disappear, sliding content aside in both modes; nudge mode additionally
+        // keeps column widths stable (see resolve_column_width).
         if !self.columns.is_empty() && !self.view_offset.is_gesture() {
             self.animate_view_offset_to_column(None, self.active_column_idx, None);
         }
@@ -2240,6 +2244,23 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         cancel_resize_for_column(&mut self.interactive_resize, col);
     }
 
+    /// Shift the view by a pixel delta, e.g. to follow a strut edge.
+    ///
+    /// The delta is in the content frame: positive values move visible content
+    /// right (clearing a left strut of the same width), negative values move
+    /// content left. The move is animated with the strut-nudge animation. Does
+    /// nothing when there are no columns or a gesture is driving the view offset.
+    pub fn shift_view_offset(&mut self, delta: f64) {
+        if delta == 0. || self.columns.is_empty() || self.view_offset.is_gesture() {
+            return;
+        }
+
+        // View offset grows leftward on screen, so negate into its frame.
+        let target = self.view_offset.target() - delta;
+        let config = self.options.layout.strut_nudge_animation.0;
+        self.animate_view_offset_with_config(self.active_column_idx, target, config);
+    }
+
     pub fn center_window(&mut self, window: Option<&W::Id>) {
         if self.columns.is_empty() {
             return;
@@ -3786,6 +3807,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     #[cfg(test)]
+    pub fn view_offset_target(&self) -> f64 {
+        self.view_offset.target()
+    }
+
+    #[cfg(test)]
     pub fn verify_invariants(&self) {
         assert!(self.view_size.w > 0.);
         assert!(self.view_size.h > 0.);
@@ -4080,6 +4106,10 @@ impl<W: LayoutElement> Column<W> {
         }
 
         if self.options.layout.gaps != options.layout.gaps {
+            update_sizes = true;
+        }
+
+        if self.options.layout.strut_behavior != options.layout.strut_behavior {
             update_sizes = true;
         }
 
@@ -4530,14 +4560,26 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn resolve_column_width(&self, width: ColumnWidth) -> f64 {
-        let working_size = self.working_area.size;
         let gaps = self.options.layout.gaps;
         let extra = self.extra_size();
 
+        // In nudge mode, resolve against the full pre-strut width, so appearing
+        // struts slide the ribbon instead of squeezing columns.
+        let mut base_w = self.working_area.size.w;
+        if matches!(
+            self.options.layout.strut_behavior,
+            StrutBehavior::NudgeRibbon
+        ) {
+            let (ribbon_left, ribbon_right) = compute_ribbon_offsets(
+                self.view_size,
+                self.parent_area,
+                self.options.layout.struts,
+            );
+            base_w += ribbon_left + ribbon_right;
+        }
+
         match width {
-            ColumnWidth::Proportion(proportion) => {
-                (working_size.w - gaps) * proportion - gaps - extra.w
-            }
+            ColumnWidth::Proportion(proportion) => (base_w - gaps) * proportion - gaps - extra.w,
             ColumnWidth::Fixed(width) => width,
         }
     }
@@ -5649,6 +5691,21 @@ fn compute_working_area(
     working_area
 }
 
+/// Compute the reserved ribbon widths on the left and right edges.
+///
+/// The ribbon combines layer-shell exclusive zones (already cut out of
+/// `parent_area`) with the configured struts. In nudge mode these offsets are
+/// added back to column widths and used as the view anchor.
+fn compute_ribbon_offsets(
+    view_size: Size<f64, Logical>,
+    parent_area: Rectangle<f64, Logical>,
+    struts: Struts,
+) -> (f64, f64) {
+    let left_layer = parent_area.loc.x.max(0.);
+    let right_layer = (view_size.w - parent_area.loc.x - parent_area.size.w).max(0.);
+    (left_layer + struts.left.0, right_layer + struts.right.0)
+}
+
 fn compute_toplevel_bounds(
     border_config: niri_config::Border,
     working_area_size: Size<f64, Logical>,
@@ -5730,5 +5787,169 @@ mod tests {
 
         let parent_area = Rectangle::from_size(Size::from((1280., 720.)));
         compute_working_area(parent_area, 1., struts);
+    }
+
+    use crate::layout::tests::{TestWindow, TestWindowParams};
+
+    fn space_with_left_strut(
+        behavior: StrutBehavior,
+        window_width: Option<i32>,
+        strut_left: f64,
+        width: ColumnWidth,
+    ) -> ScrollingSpace<TestWindow> {
+        let options = Rc::new(Options {
+            layout: niri_config::Layout {
+                struts: Struts {
+                    left: FloatOrInt(strut_left),
+                    right: FloatOrInt(0.),
+                    top: FloatOrInt(0.),
+                    bottom: FloatOrInt(0.),
+                },
+                strut_behavior: behavior,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let view_size = Size::from((1920., 1080.));
+        let parent_area = Rectangle::from_size(view_size);
+        let clock = Clock::with_time(Duration::ZERO);
+        let mut space = ScrollingSpace::new(view_size, parent_area, 1., clock.clone(), options);
+
+        if let Some(window_width) = window_width {
+            let params = TestWindowParams::new(1)
+                .with_bbox(Rectangle::from_size(Size::from((window_width, 1000))));
+            let window = TestWindow::new(params);
+            let tile = Tile::new(
+                window,
+                space.view_size,
+                space.scale,
+                clock,
+                space.options.clone(),
+            );
+            space.add_tile(None, tile, true, width, false, None);
+        }
+
+        space
+    }
+
+    #[test]
+    fn ribbon_offsets_combine_layer_and_config_struts() {
+        let view_size = Size::from((1920., 1080.));
+        // Left layer-shell panel reserving 40px.
+        let parent_area = Rectangle::new(Point::from((40., 0.)), Size::from((1880., 1080.)));
+        let struts = Struts {
+            left: FloatOrInt(12.),
+            right: FloatOrInt(8.),
+            top: FloatOrInt(0.),
+            bottom: FloatOrInt(0.),
+        };
+
+        let (left, right) = compute_ribbon_offsets(view_size, parent_area, struts);
+
+        assert_eq!(left, 52.);
+        assert_eq!(right, 8.);
+    }
+
+    #[test]
+    fn wide_column_left_aligns_at_zero() {
+        // A column wider than the view left-aligns at the area origin; the
+        // caller subtracts the area position, docking it at the ribbon edge.
+        let offset = compute_new_view_offset(0., 800., 100., 900., 16.);
+        assert_eq!(offset, 0.);
+    }
+
+    #[test]
+    fn nudge_resolves_full_column_width() {
+        let nudge = space_with_left_strut(
+            StrutBehavior::NudgeRibbon,
+            Some(800),
+            52.,
+            ColumnWidth::Proportion(0.5),
+        );
+        let squash = space_with_left_strut(
+            StrutBehavior::SquashColumns,
+            Some(800),
+            52.,
+            ColumnWidth::Proportion(0.5),
+        );
+
+        let nudge_w = nudge.columns[0].resolve_column_width(ColumnWidth::Proportion(1.));
+        let squash_w = squash.columns[0].resolve_column_width(ColumnWidth::Proportion(1.));
+
+        // Nudge adds the 52px left ribbon back; squash resolves against the
+        // strut-shrunk working area.
+        assert_eq!(nudge_w - squash_w, 52.);
+    }
+
+    #[test]
+    fn nudge_wide_column_docks_at_ribbon_edge() {
+        // Column wider than the shrunk area docks exactly at the ribbon edge,
+        // extending into the scroll area off-screen right.
+        let space = space_with_left_strut(
+            StrutBehavior::NudgeRibbon,
+            Some(1900),
+            200.,
+            ColumnWidth::Fixed(1900.),
+        );
+
+        assert_eq!(space.view_offset.target(), -200.);
+    }
+
+    #[test]
+    fn shift_view_offset_moves_content_right() {
+        let mut space = space_with_left_strut(
+            StrutBehavior::NudgeRibbon,
+            Some(800),
+            52.,
+            ColumnWidth::Proportion(0.5),
+        );
+        let before = space.view_offset.target();
+
+        // Positive delta moves content right, i.e. the view offset decreases.
+        space.shift_view_offset(52.);
+
+        assert_eq!(space.view_offset.target(), before - 52.);
+    }
+
+    #[test]
+    fn shift_view_offset_ignores_empty_space() {
+        let mut space = space_with_left_strut(
+            StrutBehavior::NudgeRibbon,
+            None,
+            52.,
+            ColumnWidth::Proportion(0.5),
+        );
+        let before = space.view_offset.target();
+
+        space.shift_view_offset(52.);
+
+        assert_eq!(space.view_offset.target(), before);
+    }
+
+    #[test]
+    fn update_config_refit_follows_area_in_both_modes() {
+        for behavior in [StrutBehavior::NudgeRibbon, StrutBehavior::SquashColumns] {
+            let mut space =
+                space_with_left_strut(behavior, Some(800), 52., ColumnWidth::Proportion(0.5));
+            let before = space.view_offset.target();
+
+            // A 52px layer panel appears on the left.
+            let view_size = Size::from((1920., 1080.));
+            let parent_area = Rectangle::new(Point::from((52., 0.)), Size::from((1868., 1080.)));
+            let options = space.options.clone();
+            space.update_config(view_size, parent_area, 1., options);
+
+            // The refit follows the working area (content slides right 52px)
+            // in both modes; only the width resolution differs.
+            assert_eq!(space.view_offset.target(), before - 52.);
+
+            // Removing the panel leaves the view alone (least motion, matching
+            // upstream): everything stays visible, just with margin restored.
+            let parent_area = Rectangle::from_size(view_size);
+            let options = space.options.clone();
+            space.update_config(view_size, parent_area, 1., options);
+            assert_eq!(space.view_offset.target(), before - 52.);
+        }
     }
 }

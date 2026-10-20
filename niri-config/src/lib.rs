@@ -1507,6 +1507,19 @@ mod tests {
                     b: 0.25,
                     a: 1.0,
                 },
+                strut_behavior: NudgeRibbon,
+                strut_nudge_animation: StrutNudgeAnimation(
+                    Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 0.88,
+                                stiffness: 800,
+                                epsilon: 0.001,
+                            },
+                        ),
+                    },
+                ),
             },
             prefer_no_csd: true,
             cursor: Cursor {

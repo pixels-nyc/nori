@@ -943,6 +943,17 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         path: Option<String>,
     },
+    /// Shift the ribbon view by a pixel delta.
+    ///
+    /// The delta is in the content frame: positive values move visible content
+    /// right (clearing a left strut of the same width), negative values move
+    /// content left. Used for non-destructive strut nudging; does not mutate
+    /// client bounds.
+    ShiftViewOffset {
+        /// Content shift in logical pixels; positive moves content right.
+        #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
+        delta: f64,
+    },
 }
 
 /// Change in window or column size.
