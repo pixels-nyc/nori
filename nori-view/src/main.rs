@@ -283,6 +283,24 @@ impl HostState {
     /// Redraw the viewer cursor when its spec changed (cheap no-op otherwise).
     fn sync_cursor(&mut self) {
         let spec = self.cursor_spec();
+        // Bounded trace: only while a slot drag is live.
+        if let Some(drag) = self.dnd.drag.as_ref() {
+            let changed = self
+                .dnd
+                .cursor
+                .as_ref()
+                .map(|c| c.spec != spec)
+                .unwrap_or(false);
+            println!(
+                "[nori-view] DnD cursor sync: inside={} held={} escaped={} files={:?} badge={:?} redraw={}",
+                self.dnd.pointer_inside,
+                self.dnd.button_held,
+                drag.escaped,
+                spec.files,
+                spec.drag,
+                changed,
+            );
+        }
         if let Some(cursor) = self.dnd.cursor.as_mut() {
             cursor.redraw(spec);
         }
@@ -499,6 +517,10 @@ struct SlotDrag {
 #[derive(Default)]
 struct DndBridge {
     sock: Option<UnixStream>,
+    /// Slot socket path, kept so a dead connection can be re-established.
+    sock_path: Option<PathBuf>,
+    /// Frames until the next reconnect attempt (0 = try now).
+    retry_cooldown: u32,
     /// Locked writer clone: host-receive threads push slot-bound data here.
     writer: Option<Arc<Mutex<UnixStream>>>,
     /// Host payloads by MIME (`None` = receive failed), shared with threads.
@@ -576,35 +598,78 @@ impl DndBridge {
     }
 
     /// Drain the slot socket (non-blocking) and handle framing/events.
+    /// A dead connection is re-established in the background: the slot
+    /// replays any active drag on `watch`, so the bridge self-heals across
+    /// slot restarts and transient I/O errors.
     fn pump(&mut self) {
+        if self.sock.is_none() {
+            if self.sock_path.is_none() {
+                return;
+            }
+            if self.retry_cooldown > 0 {
+                self.retry_cooldown -= 1;
+                return;
+            }
+            self.retry_cooldown = 600;
+            self.reconnect();
+            return;
+        }
         let mut dead = false;
         let mut events = Vec::new();
-        if self.sock.is_some() {
-            let mut tmp = [0u8; 65536];
-            loop {
-                let read_result = self.sock.as_ref().unwrap().read(&mut tmp);
-                match read_result {
-                    Ok(0) => {
-                        dead = true;
-                        break;
-                    }
-                    Ok(n) => events.extend(self.parser.push(&tmp[..n])),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        dead = true;
-                        break;
-                    }
+        let mut tmp = [0u8; 65536];
+        loop {
+            let read_result = self.sock.as_ref().unwrap().read(&mut tmp);
+            match read_result {
+                Ok(0) => {
+                    dead = true;
+                    break;
+                }
+                Ok(n) => events.extend(self.parser.push(&tmp[..n])),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // Interrupted reads are transient (signals under load): retry
+                // rather than condemning a healthy connection.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    dead = true;
+                    break;
                 }
             }
         }
         if dead {
-            println!("[nori-view] DnD socket closed; bridge disabled");
+            println!("[nori-view] DnD socket lost; will reconnect");
             self.sock = None;
+            self.writer = None;
             self.drag = None;
+            self.retry_cooldown = 0;
         }
         for event in events {
             self.handle_sock_event(event);
         }
+    }
+
+    /// Re-establish the slot connection after a loss. The slot replays any
+    /// active drag on `watch`, so mid-gesture reconnects still see the drag.
+    fn reconnect(&mut self) {
+        let Some(path) = self.sock_path.clone() else {
+            return;
+        };
+        let reader = UnixStream::connect(&path).ok().map(|sock| {
+            let _ = sock.set_nonblocking(true);
+            sock
+        });
+        let writer = UnixStream::connect(&path)
+            .ok()
+            .map(|s| Arc::new(Mutex::new(s)));
+        if reader.is_none() || writer.is_none() {
+            return;
+        }
+        self.sock = reader;
+        self.writer = writer;
+        if self.host_cache.is_none() {
+            self.host_cache = Some(Arc::new(Mutex::new(HashMap::new())));
+        }
+        self.send_cmd(&serde_json::json!({"cmd": "watch"}).to_string());
+        println!("[nori-view] DnD reconnected to {}", path.display());
     }
 
     fn handle_sock_event(&mut self, event: DndSockEvent) {
@@ -757,7 +822,10 @@ impl CursorSurface {
         })
     }
 
-    /// Redraw only when the spec changed.
+    /// Redraw only when the spec changed. Re-attaches the buffer on every
+    /// redraw: damage-only commits on an already-attached shm buffer are
+    /// silently ignored for cursor surfaces on some compositors (observed:
+    /// niri never re-reads without a fresh attach), leaving a stale image.
     fn redraw(&mut self, spec: cursor::CursorSpec) {
         if self.spec == spec {
             return;
@@ -768,6 +836,7 @@ impl CursorSurface {
         if self.file.seek(std::io::SeekFrom::Start(0)).is_ok() {
             let _ = self.file.write_all(&pixels);
         }
+        self.surface.attach(Some(&self.buffer), 0, 0);
         self.surface.damage_buffer(0, 0, cursor::ICON_SIZE, cursor::ICON_SIZE);
         self.surface.commit();
     }
@@ -2064,6 +2133,7 @@ fn main() -> Result<()> {
                 let writer = UnixStream::connect(&path)
                     .ok()
                     .map(|s| Arc::new(Mutex::new(s)));
+                host_state.dnd.sock_path = Some(PathBuf::from(&path));
                 host_state.dnd.writer = writer;
                 host_state.dnd.host_cache = Some(Arc::new(Mutex::new(HashMap::new())));
                 host_state.dnd.sock = Some(sock);
@@ -2590,6 +2660,44 @@ mod tests {
         let spec = state.cursor_spec();
         assert_eq!(spec.drag, None);
         assert!(spec.files.is_empty());
+    }
+
+    #[test]
+    fn pump_reconnects_dead_socket() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("nori-dnd-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("nori-dnd-9.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        // Bridge with no connection but a known path: first pump connects.
+        let mut bridge = DndBridge::default();
+        bridge.sock_path = Some(path.clone());
+        bridge.pump();
+        assert!(bridge.sock.is_some());
+        assert!(bridge.writer.is_some());
+        // The slot side would accept two connections (reader + writer).
+        listener.set_nonblocking(true).unwrap();
+        let mut accepted = 0;
+        for _ in 0..50 {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted += 1;
+                    drop(stream);
+                    if accepted == 2 {
+                        break;
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert_eq!(accepted, 2);
+        // A dead connection schedules a retry instead of disabling forever.
+        bridge.sock = None;
+        bridge.retry_cooldown = 0;
+        bridge.pump();
+        assert!(bridge.sock.is_some());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
