@@ -2296,7 +2296,13 @@ fn main() -> Result<()> {
     /// compositor's cast deadline expires (true standby). Mirrors the
     /// pixos watcher's SLOW->FROZEN horizon semantics (shorter: the viewer
     /// leads, the watcher follows with deck freeze + capture detach).
-    const CAPTURE_HALT_AFTER: Duration = Duration::from_secs(30);
+    /// User-tunable via NORI_CAPTURE_HALT_SEC (pixos zaxis prefs).
+    const CAPTURE_HALT_DEFAULT: Duration = Duration::from_secs(30);
+    let capture_halt_after: Duration = std::env::var("NORI_CAPTURE_HALT_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|s| Duration::from_secs(s.clamp(5, 600)))
+        .unwrap_or(CAPTURE_HALT_DEFAULT);
     let mut in_flight: HashMap<usize, ZwlrScreencopyFrameV1> = HashMap::new();
     let mut next_buffer_idx = 0;
 
@@ -2381,7 +2387,7 @@ fn main() -> Result<()> {
         let now = std::time::Instant::now();
         let past_halt = host_state
             .unfocused_since
-            .is_some_and(|t0| now.duration_since(t0) >= CAPTURE_HALT_AFTER);
+            .is_some_and(|t0| now.duration_since(t0) >= capture_halt_after);
         if past_halt && !host_state.capture_halted {
             println!("[nori-view] Unfocused past halt horizon: stopping captures (slot may standby)");
             host_state.capture_halted = true;
