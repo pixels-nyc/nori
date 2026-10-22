@@ -150,6 +150,13 @@ struct HostState {
     configured: bool,
     width: u32,
     height: u32,
+    /// Fullscreen state from toplevel configure (authoritative: compositor-set).
+    toplevel_fullscreen: bool,
+    /// Host output logical geometry (from wl_output mode+scale; used to size
+    /// the viewport destination when fullscreen configures carry no size).
+    output_width: u32,
+    output_height: u32,
+    output_scale: i32,
 
     pointer_events: Vec<PointerEvent>,
     keyboard_events: Vec<KeyboardEvent>,
@@ -171,6 +178,43 @@ struct HostState {
 }
 
 impl HostState {
+    /// Fullscreen window size: prefer the compositor-configured window size
+    /// (already logical units); fall back to output mode/scale math, then
+    /// 1920x1080. NOTE: wl_output mode is physical px but scale is integer
+    /// while niri uses fractional scale (1.5) — mode/scale math under-shoots
+    /// (1920/2=960 vs true 1280 logical), so configure size wins whenever
+    /// the compositor sent one.
+    fn fullscreen_window_size(&self) -> (u32, u32) {
+        if self.width > 0 && self.height > 0 {
+            return (self.width, self.height);
+        }
+        if self.output_width > 0 && self.output_height > 0 {
+            let s = self.output_scale.max(1) as u32;
+            return (self.output_width / s, self.output_height / s);
+        }
+        (1920, 1080)
+    }
+
+    /// Re-assert the viewport destination when fullscreen state changes.
+    /// Fullscreen configures often carry no size (or a stale tiled size),
+    /// leaving a small destination centered in a large window (black bands).
+    /// Query the output geometry directly instead of trusting configure.
+    fn refresh_fullscreen_destination(&mut self) {
+        if !self.toplevel_fullscreen {
+            return;
+        }
+        let (w, h) = self.fullscreen_window_size();
+        self.width = w;
+        self.height = h;
+        if let Some(vp) = &self.viewport {
+            vp.set_destination(w as i32, h as i32);
+        }
+        if let Some(surface) = &self.surface {
+            surface.commit();
+        }
+        println!("[nori-view] Fullscreen: viewport destination := output {w}x{h}");
+    }
+
     /// Turn a slot drag that left the viewer surface into a host-side drag.
     ///
     /// Called every frame while `escape_wanted` (set on pointer Leave). Waits
@@ -879,6 +923,9 @@ impl Dispatch<WlRegistry, ()> for HostState {
                 "wp_viewporter" => {
                     state.viewporter = Some(registry.bind(name, 1, qh, ()));
                 }
+                "wl_output" => {
+                    let _out: WlOutput = registry.bind(name, version.min(4), qh, ());
+                }
                 "wl_data_device_manager" => {
                     state.dnd.dd_manager = Some(registry.bind(name, version.min(3), qh, ()));
                 }
@@ -887,6 +934,25 @@ impl Dispatch<WlRegistry, ()> for HostState {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+impl Dispatch<WlOutput, ()> for HostState {
+    fn event(state: &mut Self, _: &WlOutput, event: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            wl_output::Event::Mode { width, height, flags, .. } => {
+                if let WEnum::Value(flags) = flags {
+                    if flags.contains(wl_output::Mode::Current) || state.output_width == 0 {
+                        state.output_width = width as u32;
+                        state.output_height = height as u32;
+                    }
+                }
+            }
+            wl_output::Event::Scale { factor } => {
+                state.output_scale = factor;
+            }
+            _ => {}
         }
     }
 }
@@ -919,9 +985,13 @@ impl Dispatch<XdgToplevel, ()> for HostState {
     fn event(state: &mut Self, _: &XdgToplevel, event: xdg_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match event {
             xdg_toplevel::Event::Configure { width, height, states } => {
-                let activated = states.chunks_exact(4).any(|chunk| {
-                    u32::from_ne_bytes(chunk.try_into().unwrap()) == wayland_protocols::xdg::shell::client::xdg_toplevel::State::Activated as u32
-                });
+                let raw: Vec<u32> = states.chunks_exact(4).map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap())).collect();
+                let activated = raw.iter().any(|s| *s == wayland_protocols::xdg::shell::client::xdg_toplevel::State::Activated as u32);
+                let fullscreen_now = raw.iter().any(|s| *s == wayland_protocols::xdg::shell::client::xdg_toplevel::State::Fullscreen as u32);
+                if fullscreen_now != state.toplevel_fullscreen {
+                    state.toplevel_fullscreen = fullscreen_now;
+                    state.refresh_fullscreen_destination();
+                }
                 if state.is_focused != activated {
                     println!("[nori-view] Focus transition: is_focused={activated}");
                     state.is_focused = activated;
@@ -2043,6 +2113,10 @@ fn main() -> Result<()> {
         configured: false,
         width: target_state.width,
         height: target_state.height,
+        toplevel_fullscreen: false,
+        output_width: 0,
+        output_height: 0,
+        output_scale: 1,
         pointer_events: Vec::new(),
         keyboard_events: Vec::new(),
         pending_axis_source: wl_pointer::AxisSource::Wheel,
@@ -2658,6 +2732,10 @@ mod tests {
             configured: false,
             width: 0,
             height: 0,
+            toplevel_fullscreen: false,
+            output_width: 0,
+            output_height: 0,
+            output_scale: 1,
             pointer_events: Vec::new(),
             keyboard_events: Vec::new(),
             pending_axis_source: wl_pointer::AxisSource::Wheel,
