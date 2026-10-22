@@ -9,6 +9,7 @@ mod animations;
 mod binds;
 mod floating;
 mod fullscreen;
+mod headless_resize;
 mod layer_shell;
 mod remove_output;
 mod strut_nudge;
