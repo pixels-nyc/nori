@@ -164,6 +164,8 @@ struct HostState {
     is_fullscreen: bool,
     is_focused: bool,
     last_unfocused_capture: Option<std::time::Instant>,
+    unfocused_since: Option<std::time::Instant>,
+    capture_halted: bool,
     closed: bool,
     dnd: DndBridge,
 }
@@ -923,6 +925,11 @@ impl Dispatch<XdgToplevel, ()> for HostState {
                 if state.is_focused != activated {
                     println!("[nori-view] Focus transition: is_focused={activated}");
                     state.is_focused = activated;
+                    if activated {
+                        state.unfocused_since = None;
+                    } else {
+                        state.unfocused_since = Some(std::time::Instant::now());
+                    }
                 }
                 if width > 0 && height > 0 {
                     state.width = width as u32;
@@ -2049,6 +2056,8 @@ fn main() -> Result<()> {
         is_fullscreen: false,
         is_focused: true,
         last_unfocused_capture: None,
+        unfocused_since: None,
+        capture_halted: false,
         closed: false,
         dnd: DndBridge::default(),
     };
@@ -2283,6 +2292,11 @@ fn main() -> Result<()> {
     let virtual_keyboard = target_state.virtual_keyboard.clone();
 
     const MAX_IN_FLIGHT: usize = 2;
+    /// Unfocused duration after which captures halt entirely so the slot
+    /// compositor's cast deadline expires (true standby). Mirrors the
+    /// pixos watcher's SLOW->FROZEN horizon semantics (shorter: the viewer
+    /// leads, the watcher follows with deck freeze + capture detach).
+    const CAPTURE_HALT_AFTER: Duration = Duration::from_secs(30);
     let mut in_flight: HashMap<usize, ZwlrScreencopyFrameV1> = HashMap::new();
     let mut next_buffer_idx = 0;
 
@@ -2357,10 +2371,28 @@ fn main() -> Result<()> {
 
         // Determine whether to initiate a screencopy frame capture:
         // - When focused: capture continuously at full speed (60 FPS)
-        // - When unfocused: throttle capture to standby rate (5 FPS = every 200ms) to let slot sleep
+        // - When unfocused < CAPTURE_HALT_AFTER: throttle to standby rate
+        //   (5 FPS = every 200ms) to let the slot sleep
+        // - When unfocused past the halt horizon: stop capturing entirely.
+        //   Zero in-flight frames lets the slot compositor's cast deadline
+        //   expire, clearing has_active_cast() so the slot drops to its
+        //   true standby clock instead of rendering 60Hz for a dark viewer.
+        //   Refocus resumes immediately (unfocused_since clears on focus).
         let now = std::time::Instant::now();
+        let past_halt = host_state
+            .unfocused_since
+            .is_some_and(|t0| now.duration_since(t0) >= CAPTURE_HALT_AFTER);
+        if past_halt && !host_state.capture_halted {
+            println!("[nori-view] Unfocused past halt horizon: stopping captures (slot may standby)");
+            host_state.capture_halted = true;
+        } else if !past_halt && host_state.capture_halted {
+            println!("[nori-view] Focus regained: resuming captures");
+            host_state.capture_halted = false;
+        }
         let should_capture = if host_state.is_focused {
             true
+        } else if past_halt {
+            false
         } else {
             match host_state.last_unfocused_capture {
                 Some(last) => now.duration_since(last) >= Duration::from_millis(200),
@@ -2633,6 +2665,8 @@ mod tests {
             is_fullscreen: false,
             is_focused: true,
             last_unfocused_capture: None,
+            unfocused_since: None,
+            capture_halted: false,
             closed: false,
             dnd: DndBridge::default(),
         };
