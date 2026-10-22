@@ -579,6 +579,75 @@ impl Headless {
         self.ipc_outputs.clone()
     }
 
+    /// Apply a transient/configured mode to a headless output.
+    ///
+    /// Called from `on_output_config_changed`: headless outputs have no DRM
+    /// connector, so mode/custom-mode requests (e.g. `nori msg output
+    /// headless-1 custom-mode 1280x800@60.000` from the z-axis fit worker)
+    /// would otherwise be silently ignored. Applies the configured size to
+    /// the Smithay output, refreshes the single-entry IPC mode list, and
+    /// drives the standard resize path (layout + layers + backdrop).
+    pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
+        // Two-phase: collect resize decisions under the shared borrow, then
+        // apply them under &mut (the outputs iterator borrows niri).
+        let planned: Vec<(Output, u16, u16, i32)> = {
+            let config = niri.config.borrow().outputs.clone();
+            niri.global_space
+                .outputs()
+                .filter_map(|output| {
+                    let name = output.user_data().get::<OutputName>()?;
+                    let entry = config.find(name)?;
+                    let want = entry.mode?;
+                    let (w, h) = (want.mode.width, want.mode.height);
+                    if w == 0 || h == 0 {
+                        return None;
+                    }
+                    let current = output.current_mode().map(|m| m.size);
+                    if current == Some((i32::from(w), i32::from(h)).into()) {
+                        return None;
+                    }
+                    let refresh = want
+                        .mode
+                        .refresh
+                        .map(|r| (r * 1000.0).round() as i32)
+                        .unwrap_or(60_000)
+                        .max(1);
+                    Some((output.clone(), w, h, refresh))
+                })
+                .collect()
+        };
+        for (output, w, h, refresh) in planned {
+            let mode = Mode {
+                size: (i32::from(w), i32::from(h)).into(),
+                refresh,
+            };
+            output.change_current_state(Some(mode), None, None, None);
+            output.set_preferred(mode);
+
+            let physical = output.physical_properties();
+            let mut ipc_outputs = self.ipc_outputs.lock().unwrap();
+            if let Some(ipc) = ipc_outputs
+                .values_mut()
+                .find(|o| o.name == output.name())
+            {
+                ipc.modes = vec![niri_ipc::Mode {
+                    width: w,
+                    height: h,
+                    refresh_rate: refresh as u32,
+                    is_preferred: true,
+                }];
+                ipc.current_mode = Some(0);
+                ipc.is_custom_mode = true;
+                ipc.make = physical.make;
+                ipc.model = physical.model;
+            }
+            drop(ipc_outputs);
+            niri.output_resized(&output);
+            niri.ipc_outputs_changed = true;
+            niri.queue_redraw(&output);
+        }
+    }
+
     #[cfg(feature = "xdp-gnome-screencast")]
     pub fn gbm_device(
         &self,
