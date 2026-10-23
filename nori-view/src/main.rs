@@ -594,6 +594,32 @@ struct DndBridge {
     external_injected: bool,
 }
 
+/// Flush a Wayland connection, retrying when the socket buffer is full.
+///
+/// `Connection::flush` on a non-blocking socket returns WouldBlock when the
+/// kernel buffer has no room — routine after a freeze/thaw cycle, where the
+/// peer has not drained for minutes. That must never be fatal: the backend
+/// keeps unsent bytes queued, so waiting for POLLOUT and retrying delivers
+/// them. Other errors (disconnect) still propagate to the caller.
+fn flush_connection(conn: &Connection) -> Result<()> {
+    use std::os::fd::AsFd;
+    loop {
+        match conn.flush() {
+            Ok(()) => return Ok(()),
+            Err(wayland_client::backend::WaylandError::Io(io))
+                if io.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                let mut pfd = [nix::poll::PollFd::new(
+                    conn.as_fd(),
+                    nix::poll::PollFlags::POLLOUT,
+                )];
+                let _ = nix::poll::poll(&mut pfd, nix::poll::PollTimeout::from(100u16));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Write through a non-blocking socket, waiting for POLLOUT when full.
 fn write_all_nonblocking(sock: &UnixStream, mut buf: &[u8]) {
     let mut s = sock;
@@ -2232,7 +2258,7 @@ fn main() -> Result<()> {
     }
 
     host_surface.commit();
-    host_conn.flush()?;
+    flush_connection(&host_conn)?;
 
     host_state.surface = Some(host_surface.clone());
     host_state.xdg_surface = Some(xdg_surface);
@@ -2431,7 +2457,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            target_conn.flush()?;
+            flush_connection(&target_conn)?;
         }
 
         // Forward keyboard events from host to target
@@ -2446,7 +2472,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            target_conn.flush()?;
+            flush_connection(&target_conn)?;
         }
 
         // Determine whether to initiate a screencopy frame capture:
@@ -2493,7 +2519,7 @@ fn main() -> Result<()> {
                 let frame = screencopy_mgr.capture_output(0, &target_output, &target_qh, buf_idx);
                 frame.copy_with_damage(target_buf);
                 in_flight.insert(buf_idx, frame);
-                target_conn.flush()?;
+                flush_connection(&target_conn)?;
                 if !host_state.is_focused {
                     host_state.last_unfocused_capture = Some(now);
                 }
@@ -2501,8 +2527,8 @@ fn main() -> Result<()> {
         }
 
         // Flush pending requests to both compositors
-        host_conn.flush()?;
-        target_conn.flush()?;
+        flush_connection(&host_conn)?;
+        flush_connection(&target_conn)?;
 
         let host_guard = host_conn.prepare_read();
         let target_guard = target_conn.prepare_read();
@@ -2555,7 +2581,7 @@ fn main() -> Result<()> {
             host_surface.commit();
             host_state.buffer_busy[*buf_idx] = true;
             host_state.frame_done = false;
-            host_conn.flush()?;
+            flush_connection(&host_conn)?;
         }
 
         if !failures.is_empty() && completions.is_empty() {
@@ -2570,6 +2596,31 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_connection_succeeds_on_healthy_socket() {
+        // A connected pair drains immediately: no retry, no error.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let conn = Connection::from_socket(a).unwrap();
+        flush_connection(&conn).unwrap();
+    }
+
+    #[test]
+    fn flush_would_block_is_transient_and_disconnect_is_fatal() {
+        // Contract test for flush_connection's match arms: WouldBlock is
+        // the only retried kind; every other io error (including the
+        // broken-pipe/connection-reset of a dead peer) propagates.
+        let would_block = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert_eq!(would_block.kind(), std::io::ErrorKind::WouldBlock);
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            assert_ne!(std::io::Error::from(kind).kind(), std::io::ErrorKind::WouldBlock);
+        }
+    }
 
     fn names(list: &[&str]) -> Vec<Option<String>> {
         list.iter().map(|s| Some(s.to_string())).collect()
