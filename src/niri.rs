@@ -1911,7 +1911,7 @@ impl State {
                 resized_outputs.push(output.clone());
             }
 
-            let mut backdrop_color = config
+            let backdrop_color = config
                 .and_then(|c| c.backdrop_color)
                 .unwrap_or(full_config.overview.backdrop_color)
                 .to_array_unpremul();
@@ -3055,7 +3055,7 @@ impl Niri {
             + c.map(|c| ipc_transform_to_smithay(c.transform))
                 .unwrap_or(Transform::Normal);
 
-        let mut backdrop_color = c
+        let backdrop_color = c
             .and_then(|c| c.backdrop_color)
             .unwrap_or(config.overview.backdrop_color)
             .to_array_unpremul();
