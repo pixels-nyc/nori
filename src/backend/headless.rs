@@ -104,6 +104,12 @@ fn standby_fps() -> u64 {
         .unwrap_or(5)
 }
 
+/// How long a file-trigger read stays cached. The redraw pump
+/// evaluates demand per iteration; without a TTL a missing file costs
+/// an openat per iteration (~3k/s storm, 2026-10-23). 250ms keeps
+/// burst/away reaction time under one standby tick at 5Hz.
+const TRIGGER_CACHE_TTL: Duration = Duration::from_millis(250);
+
 #[derive(Debug, PartialEq, Eq)]
 enum BurstState {
     Live(Option<u64>),
@@ -127,33 +133,138 @@ fn parse_burst_trigger(content: &str, now_ms: u128) -> BurstState {
     BurstState::Live(fps)
 }
 
+/// Slot identity for the trigger/hold files, e.g. "1".
+fn slot_str() -> Option<String> {
+    std::env::var("NORI_HEADLESS_SLOT")
+        .or_else(|_| std::env::var("PIXOS_HEAD"))
+        .ok()
+}
+
+/// Runtime dir for the trigger/hold files. Tests override via
+/// `NORI_TEST_RUNTIME_DIR` so they never touch the live session.
+fn trigger_runtime_dir() -> String {
+    if let Ok(dir) = std::env::var("NORI_TEST_RUNTIME_DIR") {
+        return dir;
+    }
+    std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }))
+}
+
+fn trigger_path(kind: &str, slot: &str) -> String {
+    format!("{}/nori-{}-{}", trigger_runtime_dir(), kind, slot)
+}
+
+/// Cached file-trigger read: at most one disk read per `ttl`, so the
+/// redraw pump (which evaluates demand per iteration) never turns a
+/// missing file into an openat storm. No latch: once `ttl` elapses the
+/// file is re-read, so a newly written trigger takes effect within
+/// `ttl` and a removed one clears within `ttl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedRead {
+    /// Monotonic instant of the last disk read, if any.
+    at: Option<std::time::Instant>,
+    /// Last read outcome: file content, or None when missing/invalid.
+    content: Option<TriggerContent>,
+}
+
+/// A trigger file's parsed payload: expiry + optional fps override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TriggerContent {
+    expires_ms: u128,
+    fps: Option<u64>,
+}
+
+impl CachedRead {
+    fn new() -> Self {
+        Self {
+            at: None,
+            content: None,
+        }
+    }
+
+    /// Returns the live-or-cached content for `path`. `parse` maps
+    /// file bytes to `Some(payload)` (live) or `None` (expired /
+    /// invalid — and the file is removed when expired).
+    fn get(
+        &mut self,
+        path: &str,
+        now: std::time::Instant,
+        now_ms: u128,
+        ttl: Duration,
+        parse: impl FnOnce(&str, u128) -> BurstState,
+        on_expired: impl FnOnce(),
+    ) -> Option<TriggerContent> {
+        let fresh = self
+            .at
+            .is_some_and(|at| now.duration_since(at) < ttl);
+        if !fresh {
+            let content = std::fs::read_to_string(path).ok().and_then(|text| {
+                match parse(&text, now_ms) {
+                    BurstState::Live(fps) => text
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse::<u128>().ok())
+                        .map(|expires_ms| TriggerContent { expires_ms, fps }),
+                    BurstState::Expired => {
+                        on_expired();
+                        None
+                    }
+                    BurstState::Invalid => None,
+                }
+            });
+            self.at = Some(now);
+            self.content = content;
+        }
+        // The cached expiry is authoritative inside the TTL window: a
+        // hold that expired since the read must not linger.
+        self.content.filter(|c| now_ms < c.expires_ms)
+    }
+}
+
 /// Reads the agent burst trigger file, removing it once expired.
 ///
-/// Returns (burst active, fps override).
-fn burst_trigger() -> (bool, Option<u64>) {
-    let Ok(slot_str) =
-        std::env::var("NORI_HEADLESS_SLOT").or_else(|_| std::env::var("PIXOS_HEAD"))
-    else {
+/// Returns (burst active, fps override). `cache`/`ttl` bound the disk
+/// read cadence; production callers pass the `Headless` caches with
+/// `TRIGGER_CACHE_TTL`.
+fn burst_trigger_inner(cache: &mut CachedRead, ttl: Duration) -> (bool, Option<u64>) {
+    let Some(slot) = slot_str() else {
         return (false, None);
     };
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
-    let burst_path = format!("{}/nori-burst-{}", runtime_dir, slot_str);
-    let Ok(content) = std::fs::read_to_string(&burst_path) else {
-        return (false, None);
-    };
+    let path = trigger_path("burst", &slot);
+    let now = std::time::Instant::now();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    match parse_burst_trigger(&content, now_ms) {
-        BurstState::Live(fps) => (true, fps),
-        BurstState::Expired => {
-            let _ = std::fs::remove_file(&burst_path);
-            (false, None)
-        }
-        BurstState::Invalid => (false, None),
+    match cache.get(&path, now, now_ms, ttl, parse_burst_trigger, || {
+        let _ = std::fs::remove_file(&path);
+    }) {
+        Some(c) => (true, c.fps),
+        None => (false, None),
     }
+}
+
+/// Reads the viewer-away hold file (inverse of the burst trigger).
+///
+/// Present + unexpired = force standby regardless of open casts (the
+/// VNC viewer is connected but backgrounded — WO-NORI-002). Absent /
+/// expired / invalid = current behavior. Expired files are removed.
+/// No latch: evaluated per redraw like the burst check.
+fn away_hold_active_inner(cache: &mut CachedRead, ttl: Duration) -> bool {
+    let Some(slot) = slot_str() else {
+        return false;
+    };
+    let path = trigger_path("away", &slot);
+    let now = std::time::Instant::now();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    cache
+        .get(&path, now, now_ms, ttl, parse_burst_trigger, || {
+            let _ = std::fs::remove_file(&path);
+        })
+        .is_some()
 }
 
 pub struct Headless {
@@ -166,6 +277,12 @@ pub struct Headless {
     last_render_time: Option<Duration>,
     forced_active: bool,
     standby_last_send: HashMap<Output, Duration>,
+    /// Cached file-trigger reads. The redraw pump evaluates demand
+    /// per iteration; uncached reads turned a missing burst file into
+    /// a ~3k/s openat storm on viewed-idle slots (2026-10-23). TTL
+    /// keeps trigger latency bounded while killing the storm.
+    burst_cache: CachedRead,
+    away_cache: CachedRead,
 }
 
 impl Headless {
@@ -180,6 +297,8 @@ impl Headless {
             last_render_time: None,
             forced_active: false,
             standby_last_send: HashMap::new(),
+            burst_cache: CachedRead::new(),
+            away_cache: CachedRead::new(),
         }
     }
 
@@ -369,8 +488,10 @@ impl Headless {
             .and_then(|s| s.parse().ok())
             .unwrap_or(60);
 
-        // Agent burst hold forces full rate (see burst_trigger).
-        let (burst_active, burst_fps) = burst_trigger();
+        // Agent burst hold forces full rate (cached: the redraw pump
+        // evaluates demand per iteration).
+        let (burst_active, burst_fps) =
+            burst_trigger_inner(&mut self.burst_cache, TRIGGER_CACHE_TTL);
         if burst_active {
             if let Some(fps) = burst_fps {
                 active_fps = fps.max(1);
@@ -380,7 +501,12 @@ impl Headless {
         let standby_interval = Duration::from_millis(1000 / standby_fps.max(1));
         let active_interval = Duration::from_millis(1000 / active_fps.max(1));
 
-        let is_viewer_attached = self.forced_active || burst_active || niri.screencopy_state.has_active_cast();
+        // Active whenever THIS output has presentation demand — any capture
+        // type (wlr-screencopy, ext-image-copy, PipeWire), burst, or forced.
+        // Must match try_standby_redraw's gate: the old screencopy-only
+        // check paced image-copy viewers (wayvnc) at the standby rate
+        // while still running full scene passes — 1 fps at full CPU.
+        let is_viewer_attached = self.output_has_viewer_demand(niri, output);
         let target_interval = if is_viewer_attached {
             active_interval
         } else {
@@ -395,14 +521,35 @@ impl Headless {
                 let output_state = niri.output_state.get_mut(output).unwrap();
 
                 // If a redraw was queued within the pacing throttle window, pace it via an estimated VBlank timer.
-                if matches!(output_state.redraw_state, RedrawState::Queued) {
+                //
+                // Viewed-idle sleep (2026-10-23): without this arm, a
+                // viewed-but-quiet output re-enters render() on every
+                // pump iteration at full scene-pass cost (~16%/core
+                // busy-spin behind epoll_pwait(0)). Sleeping for the
+                // remainder of the target interval restores the frame
+                // clock the standby path already enjoys.
+                if matches!(
+                    output_state.redraw_state,
+                    RedrawState::Queued
+                        | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+                ) {
                     let timer = Timer::from_duration(remaining);
                     let token = niri.event_loop.insert_source(timer, move |_, _, data| {
                         data.niri.queue_redraw(&output_clone);
                         TimeoutAction::Drop
                     }).ok();
                     if let Some(token) = token {
-                        output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+                        // Drop the superseded timer source (if any) so
+                        // dead timers cannot accumulate on the loop.
+                        if let RedrawState::WaitingForEstimatedVBlankAndQueued(old)
+                        | RedrawState::WaitingForEstimatedVBlank(old) =
+                            mem::replace(
+                                &mut output_state.redraw_state,
+                                RedrawState::WaitingForEstimatedVBlank(token),
+                            )
+                        {
+                            niri.event_loop.remove(old);
+                        }
                     }
                     return RenderResult::NoDamage;
                 }
@@ -461,12 +608,17 @@ impl Headless {
     }
 
     /// Whether anything needs full-rate frames from a headless output:
-    /// capture clients, PipeWire screencasts, or an agent burst hold.
-    fn output_has_viewer_demand(&self, niri: &Niri, output: &Output) -> bool {
+    /// capture clients, PipeWire screencasts, or an agent burst hold —
+    /// unless a viewer-away hold vetoes (WO-NORI-002: connected but
+    /// backgrounded VNC renders at standby, not full rate).
+    fn output_has_viewer_demand(&mut self, niri: &Niri, output: &Output) -> bool {
+        if away_hold_active_inner(&mut self.away_cache, TRIGGER_CACHE_TTL) {
+            return false;
+        }
         if self.forced_active {
             return true;
         }
-        if burst_trigger().0 {
+        if burst_trigger_inner(&mut self.burst_cache, TRIGGER_CACHE_TTL).0 {
             return true;
         }
         if niri.screencopy_state.has_active_cast_for_output(output) {
@@ -672,8 +824,12 @@ impl Default for Headless {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::parse_burst_trigger;
     use super::BurstState;
+    use super::CachedRead;
+    use super::TriggerContent;
 
     #[test]
     fn burst_live_with_fps_override() {
@@ -708,5 +864,126 @@ mod tests {
     fn burst_garbage_is_invalid() {
         assert_eq!(parse_burst_trigger("", 1000), BurstState::Invalid);
         assert_eq!(parse_burst_trigger("soon 60\n", 1000), BurstState::Invalid);
+    }
+
+    fn write_trigger(dir: &std::path::Path, name: &str, content: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn live_file(dir: &std::path::Path, name: &str) -> String {
+        // Far-future expiry: live for any test clock.
+        write_trigger(dir, name, "2000000000000 60\n")
+    }
+
+    #[test]
+    fn cached_read_serves_live_content() {
+        let dir = std::env::temp_dir().join(format!("nori-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = live_file(&dir, "nori-burst-1");
+
+        let mut cache = CachedRead::new();
+        let now = Instant::now();
+        let got = cache.get(&path, now, 1000, Duration::from_secs(60), parse_burst_trigger, || {
+            panic!("live file must not expire")
+        });
+        assert_eq!(
+            got,
+            Some(TriggerContent {
+                expires_ms: 2000000000000,
+                fps: Some(60),
+            })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cached_read_missing_file_stays_negative_within_ttl() {
+        // A missing file reads None once, then serves the negative
+        // result without touching disk until the TTL elapses — this is
+        // what kills the ~3k/s openat storm on trigger-less slots.
+        let dir = std::env::temp_dir().join(format!("nori-cache-neg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nori-burst-9").to_string_lossy().into_owned();
+
+        let mut cache = CachedRead::new();
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(60);
+        assert_eq!(
+            cache.get(&path, t0, 1000, ttl, parse_burst_trigger, || {}),
+            None
+        );
+        // File appears inside the TTL window: still None (stale, bounded).
+        live_file(&dir, "nori-burst-9");
+        assert_eq!(
+            cache.get(&path, t0, 1000, ttl, parse_burst_trigger, || {}),
+            None
+        );
+        // Past the TTL the re-read picks it up.
+        let got = cache.get(
+            &path,
+            t0 + ttl,
+            1000,
+            ttl,
+            parse_burst_trigger,
+            || panic!("live file must not expire"),
+        );
+        assert!(got.is_some_and(|c| c.fps == Some(60)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cached_read_expired_hold_never_lingers() {
+        // Expiry is authoritative inside the TTL window: a hold that
+        // dies between reads must clear on the next evaluation, and
+        // the expired file is removed on re-read.
+        let dir = std::env::temp_dir().join(format!("nori-cache-exp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_trigger(&dir, "nori-away-1", "5000 60\n");
+
+        let mut cache = CachedRead::new();
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(60);
+        assert!(cache
+            .get(&path, t0, 1000, ttl, parse_burst_trigger, || {})
+            .is_some());
+        // Same TTL window, clock past expiry: cleared without a re-read.
+        assert_eq!(
+            cache.get(&path, t0, 6000, ttl, parse_burst_trigger, || {
+                panic!("must not re-read inside TTL")
+            }),
+            None
+        );
+        // Past the TTL the re-read observes expiry and removes the file.
+        assert_eq!(
+            cache.get(&path, t0 + ttl, 6000, ttl, parse_burst_trigger, || {
+                let _ = std::fs::remove_file(&path);
+            }),
+            None
+        );
+        assert!(!std::path::Path::new(&path).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cached_read_invalid_file_is_negative() {
+        let dir = std::env::temp_dir().join(format!("nori-cache-inv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_trigger(&dir, "nori-away-1", "soon 60\n");
+
+        let mut cache = CachedRead::new();
+        assert_eq!(
+            cache.get(
+                &path,
+                Instant::now(),
+                1000,
+                Duration::from_secs(60),
+                parse_burst_trigger,
+                || {},
+            ),
+            None
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
