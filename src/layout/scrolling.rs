@@ -13,7 +13,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::monitor::InsertPosition;
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
-use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
+use super::tile::{RestoreToNest, Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
 use crate::animation::{Animation, Clock};
@@ -2903,7 +2903,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
 
+        let mut restore_to_nest = None;
         if is_fullscreen && (col.tiles.len() > 1 && !is_tabbed) {
+            let tile_idx = col.position(window).unwrap();
+            let above = (tile_idx > 0).then(|| col.tiles[tile_idx - 1].window().id().clone());
+            let below = (tile_idx + 1 < col.tiles.len()).then(|| col.tiles[tile_idx + 1].window().id().clone());
+            let height = col.data[tile_idx].height;
+            restore_to_nest = Some(RestoreToNest { above, below, height });
+
             // This wasn't the only window in its column; extract it into a separate column.
             self.consume_or_expel_window_right(Some(window));
             col_idx += 1;
@@ -2912,8 +2919,26 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         col.set_fullscreen(is_fullscreen);
 
+        if let Some(restore) = restore_to_nest {
+            col.tiles[0].restore_to_nest = Some(restore);
+        }
+
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
+
+        let should_restore = {
+            let col = &self.columns[col_idx];
+            !col.is_pending_fullscreen
+                && !col.is_pending_maximized
+                && col.tiles.len() == 1
+                && col.tiles[0].restore_to_nest.is_some()
+        };
+        if should_restore {
+            let restore = self.columns[col_idx].tiles[0].restore_to_nest.take().unwrap();
+            if !self.restore_tile_to_nest(col_idx, restore.clone()) {
+                self.columns[col_idx].tiles[0].restore_to_nest = Some(restore);
+            }
+        }
 
         true
     }
@@ -2934,7 +2959,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
 
+        let mut restore_to_nest = None;
         if maximize && (col.tiles.len() > 1 && !is_tabbed) {
+            let tile_idx = col.position(window).unwrap();
+            let above = (tile_idx > 0).then(|| col.tiles[tile_idx - 1].window().id().clone());
+            let below = (tile_idx + 1 < col.tiles.len()).then(|| col.tiles[tile_idx + 1].window().id().clone());
+            let height = col.data[tile_idx].height;
+            restore_to_nest = Some(RestoreToNest { above, below, height });
+
             // This wasn't the only window in its column; extract it into a separate column.
             self.consume_or_expel_window_right(Some(window));
             col_idx += 1;
@@ -2943,8 +2975,101 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         col.set_maximized(maximize);
 
+        if let Some(restore) = restore_to_nest {
+            col.tiles[0].restore_to_nest = Some(restore);
+        }
+
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
+
+        let should_restore = {
+            let col = &self.columns[col_idx];
+            !col.is_pending_fullscreen
+                && !col.is_pending_maximized
+                && col.tiles.len() == 1
+                && col.tiles[0].restore_to_nest.is_some()
+        };
+        if should_restore {
+            let restore = self.columns[col_idx].tiles[0].restore_to_nest.take().unwrap();
+            if !self.restore_tile_to_nest(col_idx, restore.clone()) {
+                self.columns[col_idx].tiles[0].restore_to_nest = Some(restore);
+            }
+        }
+
+        true
+    }
+
+    fn restore_tile_to_nest(&mut self, col_idx: usize, restore: RestoreToNest<W::Id>) -> bool {
+        let anchor = if let Some(above_id) = &restore.above {
+            self.columns.iter().find_map(|c| {
+                c.tiles.iter().position(|t| t.window().id() == above_id).map(|_| (above_id.clone(), true))
+            })
+        } else {
+            None
+        };
+
+        let anchor = anchor.or_else(|| {
+            if let Some(below_id) = &restore.below {
+                self.columns.iter().find_map(|c| {
+                    c.tiles.iter().position(|t| t.window().id() == below_id).map(|_| (below_id.clone(), false))
+                })
+            } else {
+                None
+            }
+        });
+
+        let Some((anchor_id, insert_after)) = anchor else {
+            return true;
+        };
+
+        // Don't restore into a column that is pending fullscreen (unless tabbed)
+        let target_col = self.columns.iter().find(|c| c.contains(&anchor_id)).unwrap();
+        if target_col.is_pending_fullscreen && target_col.display_mode != ColumnDisplay::Tabbed {
+            return false;
+        }
+
+        let cur_x = self.column_x(col_idx);
+        let source_column = &self.columns[col_idx];
+        let mut offset = Point::from((source_column.render_offset().x, 0.));
+        let prev_off = source_column.tile_offset(0);
+
+        let RemovedTile { tile, .. } = self.remove_tile_by_idx(
+            col_idx,
+            0,
+            Transaction::new(),
+            Some(self.options.animations.window_movement.0),
+        );
+
+        let (target_col_idx, anchor_tile_idx) = self.columns.iter().enumerate().find_map(|(c_idx, c)| {
+            c.tiles.iter().position(|t| t.window().id() == &anchor_id).map(|t_idx| (c_idx, t_idx))
+        }).unwrap();
+
+        let target_tile_idx = if insert_after {
+            anchor_tile_idx + 1
+        } else {
+            anchor_tile_idx
+        };
+
+        self.add_tile_to_column(target_col_idx, Some(target_tile_idx), tile, true);
+
+        let target_x = self.column_x(target_col_idx);
+        let target_column = &mut self.columns[target_col_idx];
+        let has_other_fixed = target_column.data.iter().enumerate().any(|(i, d)| {
+            i != target_tile_idx && matches!(d.height, WindowHeight::Fixed(_))
+        });
+        if has_other_fixed && matches!(restore.height, WindowHeight::Fixed(_)) {
+            target_column.data[target_tile_idx].height = WindowHeight::auto_1();
+        } else {
+            target_column.data[target_tile_idx].height = restore.height;
+        }
+        target_column.update_tile_sizes(true);
+        self.data[target_col_idx].update(target_column);
+
+        offset += prev_off - target_column.tile_offset(target_tile_idx);
+        offset.x += cur_x - target_x;
+        offset.x -= target_column.render_offset().x;
+
+        target_column.tiles[target_tile_idx].animate_move_from(offset);
 
         true
     }

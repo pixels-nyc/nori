@@ -657,3 +657,107 @@ fn removing_only_fullscreen_tile_updates_view_offset() {
     // FIXME: currently, removing a tile doesn't cause the view offset to update.
     assert_snapshot!(layout.active_workspace().unwrap().scrolling().view_pos(), @"0");
 }
+
+#[test]
+fn unfullscreen_restores_window_to_column_nest() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        // Put window 2 into column with window 1.
+        Op::ConsumeOrExpelWindowLeft { id: None },
+    ];
+
+    let mut layout = check_ops(ops);
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        let cols: Vec<_> = scrolling.columns().collect();
+        assert_eq!(cols.len(), 1);
+        let col = cols[0];
+        assert_eq!(col.tiles().count(), 2);
+        assert_eq!(*col.tiles().nth(0).unwrap().0.window().id(), 1);
+        assert_eq!(*col.tiles().nth(1).unwrap().0.window().id(), 2);
+    }
+
+    // Fullscreen window 2 (the bottom window).
+    let ops = [
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+        Op::CompleteAnimations,
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        // Window 2 was expelled to a separate column.
+        assert_eq!(scrolling.columns().count(), 2);
+    }
+
+    // Unfullscreen window 2.
+    let ops = [
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+        Op::CompleteAnimations,
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        // Window 2 should be restored to the column with window 1!
+        let cols: Vec<_> = scrolling.columns().collect();
+        assert_eq!(cols.len(), 1);
+        let col = cols[0];
+        assert_eq!(col.tiles().count(), 2);
+        assert_eq!(*col.tiles().nth(0).unwrap().0.window().id(), 1);
+        assert_eq!(*col.tiles().nth(1).unwrap().0.window().id(), 2);
+    }
+}
+
+#[test]
+fn unfullscreen_restores_top_window_to_column_nest() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        // Put window 2 into column with window 1.
+        Op::ConsumeOrExpelWindowLeft { id: None },
+    ];
+
+    let mut layout = check_ops(ops);
+
+    // Fullscreen window 1 (the top window).
+    let ops = [
+        Op::FullscreenWindow(1),
+        Op::Communicate(1),
+        Op::CompleteAnimations,
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        assert_eq!(scrolling.columns().count(), 2);
+    }
+
+    // Unfullscreen window 1.
+    let ops = [
+        Op::FullscreenWindow(1),
+        Op::Communicate(1),
+        Op::CompleteAnimations,
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        // Window 1 should be restored to the top of column with window 2!
+        let cols: Vec<_> = scrolling.columns().collect();
+        assert_eq!(cols.len(), 1);
+        let col = cols[0];
+        assert_eq!(col.tiles().count(), 2);
+        assert_eq!(*col.tiles().nth(0).unwrap().0.window().id(), 1);
+        assert_eq!(*col.tiles().nth(1).unwrap().0.window().id(), 2);
+    }
+}

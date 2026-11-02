@@ -62,6 +62,9 @@ pub struct Tile<W: LayoutElement> {
     /// Whether the tile should float upon unfullscreening.
     pub(super) restore_to_floating: bool,
 
+    /// Whether the tile was expelled from a multi-window column and should be restored upon unfullscreening.
+    pub(super) restore_to_nest: Option<RestoreToNest<W::Id>>,
+
     /// The size that the window should assume when going floating.
     ///
     /// This is generally the last size the window had when it was floating. It can be unknown if
@@ -139,6 +142,13 @@ niri_render_elements! {
 pub type TileRenderSnapshot =
     RenderSnapshot<TileRenderElement<GlesRenderer>, TileRenderElement<GlesRenderer>>;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreToNest<Id> {
+    pub above: Option<Id>,
+    pub below: Option<Id>,
+    pub height: super::scrolling::WindowHeight,
+}
+
 #[derive(Debug)]
 struct ResizeAnimation {
     anim: Animation,
@@ -200,6 +210,7 @@ impl<W: LayoutElement> Tile<W> {
             sizing_mode,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
             restore_to_floating: false,
+            restore_to_nest: None,
             floating_window_size: None,
             floating_pos: None,
             floating_preset_width_idx: None,
