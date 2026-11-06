@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 gbm = "0.18.0"
-drm = "0.14"
+drm = "0.15"
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }

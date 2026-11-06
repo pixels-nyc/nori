@@ -880,6 +880,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "drm"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a41816e58f47f49acfd956651055ddcf137c4882c2098c30c448817af21183a"
+dependencies = [
+ "bitflags",
+ "bytemuck",
+ "bytemuck_derive",
+ "drm-ffi",
+ "drm-fourcc",
+ "libc",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "drm-ffi"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1133,7 +1148,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce852e998d3ca5e4a97014fb31c940dc5ef344ec7d364984525fd11e8a547e6a"
 dependencies = [
  "bitflags",
- "drm",
+ "drm 0.14.1",
  "drm-fourcc",
  "gbm-sys",
  "libc",
@@ -2343,7 +2358,7 @@ dependencies = [
  "calloop",
  "calloop-wayland-source",
  "clap",
- "drm",
+ "drm 0.15.0",
  "gbm",
  "nix",
  "serde_json",
@@ -3423,7 +3438,7 @@ dependencies = [
  "cc",
  "cursor-icon",
  "downcast-rs",
- "drm",
+ "drm 0.14.1",
  "drm-ffi",
  "drm-fourcc",
  "drm-sys",
@@ -3493,7 +3508,7 @@ name = "smithay-drm-extras"
 version = "0.1.0"
 source = "git+https://github.com/Smithay/smithay.git?rev=79bbed5e1199090d787115614847a79c76607181#79bbed5e1199090d787115614847a79c76607181"
 dependencies = [
- "drm",
+ "drm 0.14.1",
  "libdisplay-info",
 ]
 
